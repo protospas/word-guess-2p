@@ -14,17 +14,30 @@
 // ---------- Связь между игроками ----------
 // Сообщения идут через бесплатные публичные серверы (MQTT). Прямое соединение не нужно,
 // поэтому работает в любых сетях, в том числе на мобильном интернете.
+// role: 'host' (создал комнату) / 'guest' (вошёл) — это только про связь.
+// side: 'setter' (загадывает) / 'guesser' (угадывает) — игроки выбирают сами в лобби.
 const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
 const TOPIC = 'wduel-p2p-v1/';
 const ME = Math.random().toString(36).slice(2, 10);
-const ROWS = [
-  ['Й','Ц','У','К','Е','Н','Г','Ш','Щ','З','Х','Ъ'],
-  ['Ф','Ы','В','А','П','Р','О','Л','Д','Ж','Э'],
-  ['Я','Ч','С','М','И','Т','Ь','Б','Ю']
-];
+const LAYOUTS = {
+  ru: [
+    ['Й','Ц','У','К','Е','Н','Г','Ш','Щ','З','Х','Ъ'],
+    ['Ф','Ы','В','А','П','Р','О','Л','Д','Ж','Э'],
+    ['Я','Ч','С','М','И','Т','Ь','Б','Ю','Ё']
+  ],
+  en: [
+    ['Q','W','E','R','T','Y','U','I','O','P'],
+    ['A','S','D','F','G','H','J','K','L'],
+    ['Z','X','C','V','B','N','M']
+  ]
+};
+const LETTER = /^[\p{Script=Cyrillic}\p{Script=Latin}]+$/u;   // кириллица и латиница
+const RANK = { absent: 1, present: 2, correct: 3 };
 
 // ---------- Состояние ----------
-const S = { role: null, room: '', status: 'menu', connected: false, hostReady: false, guestReady: false,
+// status: menu → lobby (выбор ролей) → setup (загадывающий вводит слово) / waiting (угадывающий ждёт) → playing → won → lobby ...
+const S = { role: null, room: '', status: 'menu', connected: false,
+  pick: { host: null, guest: null }, side: null, round: 0, keys: {}, kb: 'ru',
   word: '', len: 5, letters: [], marks: [], active: 0, attempts: 0, remoteInput: [], remoteMarks: [],
   error: '', logs: [], copied: false };
 let client = null, guestId = null, lastSeen = 0, heartbeat = null;
@@ -79,7 +92,7 @@ function tick() {
   if (S.connected && Date.now() - lastSeen > 15000) { S.connected = false; log('Соединение с игроком потеряно'); }
 }
 
-// ---------- Создание комнаты (хост) ----------
+// ---------- Создание комнаты ----------
 function createRoom() {
   stop();
   const code = Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -88,7 +101,7 @@ function createRoom() {
   connectBroker(code, () => { S.status = 'lobby'; log('Комната готова. Код: ' + code); });
 }
 
-// ---------- Вход в комнату (гость) ----------
+// ---------- Вход в комнату ----------
 function joinRoom(code) {
   code = (code || '').trim().toUpperCase();
   if (!code) return;
@@ -113,9 +126,11 @@ function receive(d) {
   if (S.role === 'host') {
     if (d.t === 'HELLO') {
       if (!guestId || guestId === d.from || !S.connected) {
+        // новый игрок зашёл посреди игры — начинаем заново с лобби
+        if (!['lobby', 'menu'].includes(S.status) && guestId !== d.from) { S.round++; resetToLobby(); }
         guestId = d.from; S.connected = true; lastSeen = Date.now();
-        send({ t: 'WELCOME', to: d.from });
-        send({ t: 'READY', role: 'host', ready: S.hostReady });
+        send({ t: 'WELCOME', to: d.from, round: S.round });
+        send({ t: 'PICK', side: S.pick.host, round: S.round });
         log('Игрок 2 подключился!');
       }
       return;
@@ -124,8 +139,11 @@ function receive(d) {
   } else {
     if (d.to && d.to !== ME) return;
     if (d.t === 'WELCOME') {
-      S.connected = true; S.status = 'lobby'; lastSeen = Date.now();
-      log('Подключено к хосту!');
+      S.round = d.round || 0;
+      S.connected = true; lastSeen = Date.now();
+      if (S.status === 'menu') S.status = 'lobby';
+      if (S.status === 'lobby') send({ t: 'PICK', side: S.pick.guest, round: S.round });
+      log('Подключено к комнате!');
       return;
     }
     if (S.status === 'menu') return;
@@ -138,69 +156,89 @@ function receive(d) {
 }
 
 function onData(d) {
-  if (d.t === 'READY') {
-    if (d.role === 'host') S.hostReady = d.ready; else S.guestReady = d.ready;
-    checkBoth();
+  if (d.t === 'PICK') {
+    if (d.round === S.round && S.status === 'lobby') { S.pick[d.r] = d.side; checkStart(); }
   } else if (d.t === 'WORD') {
-    S.word = d.word; S.len = d.len; S.letters = Array(d.len).fill(''); S.marks = Array(d.len).fill('');
-    S.active = 0; S.attempts = 0; S.status = 'playing';
+    if (S.side === 'guesser') {
+      S.word = d.word; S.len = d.len; S.letters = Array(d.len).fill(''); S.marks = Array(d.len).fill('');
+      S.active = 0; S.attempts = 0; S.status = 'playing';
+      S.keys = {}; S.kb = /\p{Script=Cyrillic}/u.test(d.word) ? 'ru' : 'en';
+    }
   } else if (d.t === 'INPUT') {
-    S.remoteInput = d.input; S.remoteMarks = d.marks;
-    if (d.attempts != null) S.attempts = d.attempts;
+    if (S.side === 'setter') {
+      S.remoteInput = d.input; S.remoteMarks = d.marks;
+      if (d.attempts != null) S.attempts = d.attempts;
+    }
   } else if (d.t === 'OVER') {
     S.status = d.result; S.attempts = d.attempts;
   } else if (d.t === 'RESET') {
-    resetState();
+    if (d.round > S.round) { S.round = d.round; resetToLobby(); }
   }
   render();
 }
 
-// ---------- Лобби ----------
-function checkBoth() {
-  if (S.hostReady && S.guestReady && S.status === 'lobby' && S.role === 'host') S.status = 'setup';
+// ---------- Лобби: выбор ролей ----------
+function otherRole() { return S.role === 'host' ? 'guest' : 'host'; }
+
+function checkStart() {
+  if (S.status !== 'lobby') return;
+  const mine = S.pick[S.role], theirs = S.pick[otherRole()];
+  if (mine && theirs && mine !== theirs) {
+    S.side = mine;
+    S.status = mine === 'setter' ? 'setup' : 'waiting';
+    S.error = '';
+  }
 }
-function toggleReady() {
-  const k = S.role === 'host' ? 'hostReady' : 'guestReady';
-  S[k] = !S[k];
-  send({ t: 'READY', role: S.role, ready: S[k] });
-  checkBoth(); render();
+function pick(side) {
+  if (S.status !== 'lobby' || !S.connected) return;
+  S.pick[S.role] = S.pick[S.role] === side ? null : side;   // повторное нажатие снимает выбор
+  send({ t: 'PICK', side: S.pick[S.role], round: S.round });
+  checkStart(); render();
 }
-function resetState() {
-  Object.assign(S, { hostReady: false, guestReady: false, word: '', status: 'lobby', letters: [], marks: [],
+function resetToLobby() {
+  Object.assign(S, { pick: { host: null, guest: null }, side: null, keys: {}, kb: 'ru', word: '', status: 'lobby', letters: [], marks: [],
     active: 0, attempts: 0, remoteInput: [], remoteMarks: [], error: '' });
 }
-function resetGame() { send({ t: 'RESET' }); resetState(); render(); }
+// Новый раунд: оба игрока возвращаются в лобби и снова выбирают роли
+function newRound() {
+  S.round++;
+  send({ t: 'RESET', round: S.round });
+  resetToLobby(); render();
+}
 
-// ---------- Загадать слово (хост) ----------
+// ---------- Загадать слово ----------
 function setWord() {
-  const w = ($('word').value || '').trim().toUpperCase().replace(/Ё/g, 'Е');
-  if (w.length < 3 || w.length > 10) return err('Слово должно быть от 3 до 10 букв!');
-  if (!/^[А-Я]+$/.test(w)) return err('Только русские буквы!');
-  S.error = ''; S.word = w; S.len = w.length; S.attempts = 0; S.remoteInput = []; S.remoteMarks = [];
+  if (S.side !== 'setter' || S.status !== 'setup') return;
+  const w = ($('word').value || '').trim().toUpperCase();
+  const n = Array.from(w).length;
+  if (n < 2) return err('Слово должно быть хотя бы из 2 букв!');
+  if (!LETTER.test(w)) return err('Только буквы (кириллица или латиница), без пробелов и цифр!');
+  S.error = ''; S.word = w; S.len = n; S.attempts = 0; S.remoteInput = []; S.remoteMarks = [];
   S.status = 'playing';
-  send({ t: 'WORD', word: w, len: w.length });
+  send({ t: 'WORD', word: w, len: n });
   render();
 }
 
-// ---------- Игра (гость) ----------
+// ---------- Игра (угадывающий) ----------
+function canGuess() { return S.side === 'guesser' && S.status === 'playing'; }
 function sync() { send({ t: 'INPUT', input: S.letters, marks: S.marks }); render(); }
 function press(ch) {
-  if (S.role !== 'guest' || S.status !== 'playing') return;
+  if (!canGuess()) return;
   S.letters[S.active] = ch; S.marks[S.active] = '';
   if (S.active < S.len - 1) S.active++;
   sync();
 }
 function del() {
-  if (S.role !== 'guest' || S.status !== 'playing') return;
+  if (!canGuess()) return;
   if (!S.letters[S.active] && S.active > 0) S.active--;
   S.letters[S.active] = ''; S.marks[S.active] = '';
   sync();
 }
 function check() {
-  if (S.role !== 'guest' || S.status !== 'playing') return;
+  if (!canGuess()) return;
   if (S.letters.some(l => !l)) return err('Заполните все ' + S.len + ' букв!');
   S.error = '';
-  const t = S.word.split(''), g = S.letters, r = Array(S.len).fill('absent'), used = Array(S.len).fill(false);
+  const t = Array.from(S.word), g = S.letters, r = Array(S.len).fill('absent'), used = Array(S.len).fill(false);
   g.forEach((c, i) => { if (c === t[i]) { r[i] = 'correct'; used[i] = true; } });
   g.forEach((c, i) => {
     if (r[i] === 'correct') return;
@@ -208,10 +246,11 @@ function check() {
     if (j > -1) { r[i] = 'present'; used[j] = true; }
   });
   S.marks = r; S.attempts++;
-  const won = r.every(x => x === 'correct');
-  if (won) S.status = 'won';
+  // запоминаем статус каждой буквы для клавиатуры (лучший результат по всем попыткам)
+  g.forEach((c, i) => { const old = S.keys[c]; if (!old || RANK[r[i]] > RANK[old]) S.keys[c] = r[i]; });
+  if (r.every(x => x === 'correct')) S.status = 'won';
   send({ t: 'INPUT', input: S.letters, marks: r, attempts: S.attempts });
-  if (S.status !== 'playing') send({ t: 'OVER', result: S.status, attempts: S.attempts });
+  if (S.status === 'won') send({ t: 'OVER', result: 'won', attempts: S.attempts });
   render();
 }
 function copyLink() {
@@ -227,18 +266,18 @@ const CARD = 'bg-slate-900 border border-slate-800 p-6 rounded-3xl flex flex-col
 function render() {
   const focused = document.activeElement && document.activeElement.id;
   const saved = { code: $('code') && $('code').value, word: $('word') && $('word').value };
-  const me = S.role === 'host' ? S.hostReady : S.guestReady;
   const st = S.status;
   let h = '';
 
   // Шапка
+  const inGame = ['setup', 'waiting', 'playing', 'won'].includes(st);
   h += `<header class="flex items-center justify-between pb-3 border-b border-slate-800">
     <h1 class="text-xl font-black tracking-wider">WORD DUEL</h1>
-    ${S.room && S.role === 'host' ? `<div class="flex items-center gap-2 text-xs">
+    ${S.room ? `<div class="flex items-center gap-2 text-xs">
       <span class="font-mono text-slate-400">Код: <b class="text-cyan-400">${esc(S.room)}</b></span>
       <button onclick="copyLink()" class="px-3 py-1 bg-cyan-600 rounded-lg font-bold">${S.copied ? 'Скопировано!' : 'Ссылка'}</button>
-      <button onclick="resetGame()" class="px-2 py-1 bg-slate-800 rounded-lg" title="Сбросить игру">↺</button>
-    </div>` : (S.room ? `<span class="font-mono text-xs text-slate-400">Код: <b class="text-cyan-400">${esc(S.room)}</b></span>` : '')}
+      ${inGame ? `<button onclick="newRound()" class="px-2 py-1 bg-slate-800 rounded-lg" title="Вернуться в лобби и выбрать роли заново">↺</button>` : ''}
+    </div>` : ''}
   </header>`;
 
   if (S.error) h += `<div class="p-3 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-xl text-xs text-center font-semibold">⚠️ ${esc(S.error)}</div>`;
@@ -257,59 +296,80 @@ function render() {
     </div>`;
   }
 
-  // Лобби
+  // Лобби: выбор ролей
   if (st === 'lobby') {
-    const card = (title, ready) => `<div class="p-4 rounded-2xl border ${ready ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}">
-      <div class="text-xs font-semibold">${title}</div><div class="text-sm font-black mt-1">${ready ? 'ГОТОВ ✓' : 'Ожидание...'}</div></div>`;
+    const mine = S.pick[S.role], theirs = S.pick[otherRole()];
+    const label = p => p === 'setter' ? '✍️ Загадывает' : p === 'guesser' ? '🔍 Угадывает' : 'Выбирает...';
+    const card = (title, p) => `<div class="p-4 rounded-2xl border ${p ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}">
+      <div class="text-xs font-semibold">${title}</div><div class="text-sm font-black mt-1">${label(p)}</div></div>`;
+    const opt = (side, text) => `<button onclick="pick('${side}')" class="${BTN} ${mine === side ? 'bg-emerald-600' : 'bg-slate-800'}">${text}</button>`;
     let note = '';
     if (!S.connected) note = 'Ждём второго игрока... Отправьте ему ссылку или код.';
-    else if (S.hostReady && S.guestReady) note = 'Оба готовы! Ведущий загадывает слово...';
+    else if (mine && theirs && mine === theirs) note = 'Вы выбрали одинаковые роли. Один из вас должен выбрать другую.';
+    else if (!mine) note = 'Выберите свою роль. Игра начнётся, когда роли будут разными.';
+    else note = 'Ждём выбор соперника...';
     h += `<div class="${CARD}">
       <h2 class="text-xl font-bold">Лобби</h2>
-      <div class="grid grid-cols-2 gap-3">${card('Игрок 1 (загадывает)', S.hostReady)}${card('Игрок 2 (угадывает)', S.guestReady)}</div>
-      ${S.connected ? `<button onclick="toggleReady()" class="${BTN} ${me ? 'bg-slate-800 text-slate-300' : 'bg-emerald-600'}">${me ? 'Отменить готовность' : 'Я ГОТОВ К ИГРЕ!'}</button>` : ''}
+      <div class="grid grid-cols-2 gap-3">${card('Вы', mine)}${card('Соперник', theirs)}</div>
+      ${S.connected ? `<div class="flex flex-col gap-2">${opt('setter', '✍️ Я загадываю слово')}${opt('guesser', '🔍 Я угадываю слово')}</div>` : ''}
       <p class="text-xs text-slate-400">${note}</p>
     </div>`;
   }
 
-  // Ведущий загадывает слово
-  if (st === 'setup' && S.role === 'host') {
+  // Загадывающий вводит слово
+  if (st === 'setup') {
     h += `<div class="${CARD}">
       <h2 class="text-xl font-bold">Загадайте тайное слово</h2>
-      <input id="word" placeholder="3-10 БУКВ" maxlength="10" onkeydown="if(event.key==='Enter')setWord()"
+      <p class="text-xs text-slate-400">Любая длина, кириллица или латиница</p>
+      <input id="word" placeholder="СЛОВО" autocomplete="off" onkeydown="if(event.key==='Enter')setWord()"
         class="w-full bg-slate-950 border-2 border-slate-700 focus:border-cyan-500 rounded-2xl p-4 text-center text-2xl font-black tracking-widest uppercase outline-none">
       <button onclick="setWord()" class="${BTN} bg-cyan-600">Начать дуэль!</button>
     </div>`;
   }
 
+  // Угадывающий ждёт
+  if (st === 'waiting') {
+    h += `<div class="${CARD}">
+      <h2 class="text-xl font-bold">Соперник загадывает слово...</h2>
+      <p class="text-xs text-slate-400">Игра начнётся, как только слово будет готово.</p>
+    </div>`;
+  }
+
   // Игра
-  if (['playing', 'won', 'lost'].includes(st)) {
-    const isGuest = S.role === 'guest';
-    const letters = isGuest ? S.letters : S.remoteInput;
-    const marks = isGuest ? S.marks : S.remoteMarks;
+  if (st === 'playing' || st === 'won') {
+    const guesser = S.side === 'guesser';
+    const letters = guesser ? S.letters : S.remoteInput;
+    const marks = guesser ? S.marks : S.remoteMarks;
     const colors = { correct: 'bg-emerald-600 border-emerald-500', present: 'bg-amber-500 border-amber-400', absent: 'bg-slate-800 border-slate-700 text-slate-400' };
     let cells = '';
     for (let i = 0; i < S.len; i++) {
       const cls = colors[(marks || [])[i]] || 'bg-slate-900 border-slate-800';
-      const act = isGuest && st === 'playing' && i === S.active ? 'ring-4 ring-cyan-500/30 border-cyan-400 scale-105' : '';
-      cells += `<button onclick="S.active=${i};render()" class="w-11 h-14 sm:w-14 sm:h-16 rounded-xl border-2 font-black text-2xl flex items-center justify-center transition-all ${cls} ${act}">${esc((letters || [])[i])}</button>`;
+      const act = guesser && st === 'playing' && i === S.active ? 'ring-4 ring-cyan-500/30 border-cyan-400 scale-105' : '';
+      cells += `<button onclick="S.active=${i};render()" style="width:var(--w);height:calc(var(--w)*1.25);font-size:calc(var(--w)*.55)" class="rounded-xl border-2 font-black flex items-center justify-center transition-all ${cls} ${act}">${esc((letters || [])[i])}</button>`;
     }
     h += `<div class="flex flex-col items-center gap-4">
       <div class="w-full flex justify-between text-xs text-slate-400 px-2">
         <span>Попытки: <b class="text-cyan-400 text-sm">${S.attempts}</b></span>
-        ${!isGuest ? `<span>Загадано: <b class="text-emerald-400 font-mono">${esc(S.word)}</b></span>` : ''}
+        ${!guesser ? `<span>Загадано: <b class="text-emerald-400 font-mono">${esc(S.word)}</b></span>` : `<span>Вы угадываете</span>`}
       </div>
-      <div class="flex justify-center gap-1.5 w-full">${cells}</div>`;
-    if (st === 'won') h += `<div class="p-4 bg-emerald-950/60 border border-emerald-500/40 rounded-2xl text-center w-full"><b class="text-emerald-300">СЛОВО УГАДАНО! 🎉</b><div class="text-xs mt-1">Слово: <b>${esc(S.word)}</b></div></div>`;
-    if (st === 'lost') h += `<div class="p-4 bg-rose-950/60 border border-rose-500/40 rounded-2xl text-center w-full"><b class="text-rose-400">ПОПЫТКИ ЗАКОНЧИЛИСЬ 😞</b><div class="text-xs mt-1">Слово: <b>${esc(S.word)}</b></div></div>`;
-    if (st !== 'playing' && !isGuest) h += `<button onclick="resetGame()" class="${BTN} bg-cyan-600">Сыграть ещё раз</button>`;
-    if (isGuest && st === 'playing') {
+      <div class="flex flex-wrap justify-center gap-1.5 w-full" style="--w:clamp(22px, calc((min(100vw, 576px) - 64px) / ${S.len} - 6px), 56px)">${cells}</div>`;
+    if (st === 'won') {
+      h += `<div class="p-4 bg-emerald-950/60 border border-emerald-500/40 rounded-2xl text-center w-full">
+        <b class="text-emerald-300">${guesser ? 'ВЫ УГАДАЛИ СЛОВО! 🎉' : 'СОПЕРНИК УГАДАЛ СЛОВО! 🎉'}</b>
+        <div class="text-xs mt-1">Слово: <b>${esc(S.word)}</b> · попыток: ${S.attempts}</div></div>
+        <button onclick="newRound()" class="${BTN} bg-cyan-600">Начать новый раунд</button>`;
+    }
+    if (guesser && st === 'playing') {
+      // буквы, которых нет на раскладках (например, украинские), добавляются отдельной строкой
+      const known = new Set([...LAYOUTS.ru.flat(), ...LAYOUTS.en.flat()]);
+      const extra = [...new Set(Array.from(S.word))].filter(c => !known.has(c));
+      const rows = LAYOUTS[S.kb].concat(extra.length ? [extra] : []);
+      // буквы, которые проверка признала «нет в слове», затемняются
+      const key = c => `<button onclick="press('${c}')" class="flex-1 max-w-[38px] h-11 rounded-lg font-bold text-sm transition ${S.keys[c] === 'absent' ? 'bg-slate-900 text-slate-600 opacity-40' : 'bg-slate-800 active:bg-cyan-600'}">${c}</button>`;
       h += `<div class="w-full flex flex-col gap-1.5 select-none">`;
-      ROWS.forEach(row => {
-        h += `<div class="flex justify-center gap-1">` + row.map(c =>
-          `<button onclick="press('${c}')" class="flex-1 max-w-[38px] h-11 bg-slate-800 rounded-lg font-bold text-sm active:bg-cyan-600">${c}</button>`).join('') + `</div>`;
-      });
+      rows.forEach(row => { h += `<div class="flex justify-center gap-1">${row.map(key).join('')}</div>`; });
       h += `<div class="flex gap-2 mt-1">
+        <button onclick="S.kb=S.kb==='ru'?'en':'ru';render()" class="px-4 py-3 bg-slate-800 font-bold rounded-xl text-xs">🌐 ${S.kb === 'ru' ? 'EN' : 'RU'}</button>
         <button onclick="del()" class="flex-1 py-3 bg-slate-800 font-bold rounded-xl text-xs">✕ СТЕРЕТЬ</button>
         <button onclick="check()" class="flex-[2] py-3 bg-emerald-600 font-bold rounded-xl text-xs">✓ ПРОВЕРИТЬ</button>
       </div></div>`;
@@ -321,7 +381,7 @@ function render() {
   h += `<footer class="pt-3 border-t border-slate-800 text-[10px] text-slate-500 font-mono">
     <div class="flex justify-between mb-1">
       <span>Связь: <b class="${S.connected ? 'text-emerald-400' : 'text-amber-400'}">${S.connected ? 'есть' : 'нет'}</b></span>
-      <span>Роль: ${S.role || '—'} · версия 3</span>
+      <span>${S.side === 'setter' ? 'Загадываю' : S.side === 'guesser' ? 'Угадываю' : 'Роль не выбрана'} · версия 5</span>
     </div>
     <div class="bg-slate-900 border border-slate-800 p-2 rounded-lg max-h-24 overflow-y-auto">${S.logs.map(l => '> ' + esc(l)).join('<br>')}</div>
   </footer>`;
@@ -337,10 +397,10 @@ document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.ctrlKey || e.metaKey) return;
   if (e.key === 'Backspace') del();
   else if (e.key === 'Enter') check();
-  else if (/^[а-яё]$/i.test(e.key)) press(e.key.toUpperCase().replace('Ё', 'Е'));
+  else if (e.key.length === 1 && LETTER.test(e.key)) press(e.key.toUpperCase());
 });
 
-// ---------- Старт: если открыли по ссылке с #КОД — входим как гость ----------
+// ---------- Старт: если открыли по ссылке с #КОД — входим в комнату ----------
 render();
 const hash = location.hash.replace('#', '').trim();
 if (hash) joinRoom(hash);
