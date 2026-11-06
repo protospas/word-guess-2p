@@ -3,97 +3,140 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Word Duel — P2P Online</title>
+<title>Word Duel — Online</title>
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+<script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen">
 <div id="app" class="max-w-xl mx-auto p-4 flex flex-col gap-4"></div>
 
 <script>
-// ---------- Настройки сети (STUN + TURN, чтобы соединение работало в любых сетях) ----------
-const CFG = {
-  debug: 1,
-  config: { iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
-  ]}
-};
+// ---------- Связь между игроками ----------
+// Сообщения идут через бесплатные публичные серверы (MQTT). Прямое соединение не нужно,
+// поэтому работает в любых сетях, в том числе на мобильном интернете.
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
+const TOPIC = 'wduel-p2p-v1/';
+const ME = Math.random().toString(36).slice(2, 10);
 const ROWS = [
   ['Й','Ц','У','К','Е','Н','Г','Ш','Щ','З','Х','Ъ'],
   ['Ф','Ы','В','А','П','Р','О','Л','Д','Ж','Э'],
   ['Я','Ч','С','М','И','Т','Ь','Б','Ю']
 ];
-const PREFIX = 'word-duel-p2p-';
 
 // ---------- Состояние ----------
 const S = { role: null, room: '', status: 'menu', connected: false, hostReady: false, guestReady: false,
   word: '', len: 5, letters: [], marks: [], active: 0, attempts: 0, remoteInput: [], remoteMarks: [],
   error: '', logs: [], copied: false };
-let peer = null, conn = null;
+let client = null, guestId = null, lastSeen = 0, heartbeat = null;
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s || '').replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
-const send = d => { if (conn && conn.open) conn.send(d); };
-function log(m) { console.log('[P2P]', m); S.logs.unshift(m); S.logs = S.logs.slice(0, 6); render(); }
+function log(m) { console.log('[GAME]', m); S.logs.unshift(m); S.logs = S.logs.slice(0, 6); render(); }
 function err(m) { S.error = m; render(); }
+
+function send(d) {
+  if (client && client.connected) client.publish(TOPIC + S.room, JSON.stringify({ ...d, from: ME, r: S.role }), { qos: 1 });
+}
+function stop() {
+  if (client) { client.end(true); client = null; }
+  guestId = null; S.connected = false;
+}
+function failStart(msg) {
+  stop();
+  S.error = msg;
+  if (S.status === 'menu') { S.role = null; S.room = ''; }
+  log(msg);
+}
+
+// Подключение к серверу сообщений (если первый не отвечает, пробуем второй)
+function connectBroker(room, onReady, i = 0) {
+  if (i >= BROKERS.length) return failStart('Не удалось подключиться к серверу сообщений. Попробуйте позже.');
+  log('Подключаюсь к серверу ' + (i + 1) + ' из ' + BROKERS.length + '...');
+  const c = mqtt.connect(BROKERS[i], { clientId: 'wd_' + ME + '_' + i, reconnectPeriod: 2000, connectTimeout: 8000 });
+  let done = false;
+  const timer = setTimeout(() => { if (!done) { c.end(true); connectBroker(room, onReady, i + 1); } }, 9000);
+
+  c.on('connect', () => {
+    if (done) return;
+    c.subscribe(TOPIC + room, { qos: 1 }, e => {
+      if (e || done) return;
+      done = true; clearTimeout(timer); client = c;
+      if (!heartbeat) heartbeat = setInterval(tick, 4000);
+      onReady();
+    });
+  });
+  c.on('message', (_, buf) => {
+    let d; try { d = JSON.parse(buf.toString()); } catch (e) { return; }
+    receive(d);
+  });
+  c.on('error', e => console.log('MQTT error', e && e.message));
+}
+
+// Раз в 4 секунды: пинг и проверка, что второй игрок ещё на связи
+function tick() {
+  if (!client || !S.room) return;
+  send({ t: 'PING' });
+  if (S.connected && Date.now() - lastSeen > 15000) { S.connected = false; log('Соединение с игроком потеряно'); }
+}
 
 // ---------- Создание комнаты (хост) ----------
 function createRoom() {
-  const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+  stop();
+  const code = Math.random().toString(36).substring(2, 8).toUpperCase();
   S.role = 'host'; S.room = code; S.error = '';
   log('Создаём комнату ' + code + '...');
-  peer = new Peer(PREFIX + code, CFG);
-
-  peer.on('open', () => { S.status = 'lobby'; log('Комната готова. Код: ' + code); });
-  peer.on('disconnected', () => { log('Связь с сервером потеряна, переподключаюсь...'); peer.reconnect(); });
-  peer.on('error', e => { S.error = 'Ошибка: ' + e.type; log('Ошибка: ' + e.type); });
-  peer.on('connection', c => {
-    if (conn && conn.open) { c.close(); return; }
-    const onOpen = () => {
-      conn = c; S.connected = true;
-      log('Игрок 2 подключился!');
-      send({ t: 'READY', role: 'host', ready: S.hostReady });
-    };
-    if (c.open) onOpen(); else c.on('open', onOpen);
-    c.on('data', onData);
-    c.on('close', () => { S.connected = false; log('Игрок 2 отключился'); });
-  });
+  connectBroker(code, () => { S.status = 'lobby'; log('Комната готова. Код: ' + code); });
 }
 
 // ---------- Вход в комнату (гость) ----------
 function joinRoom(code) {
   code = (code || '').trim().toUpperCase();
   if (!code) return;
+  stop();
   S.role = 'guest'; S.room = code; S.error = '';
   log('Подключаемся к комнате ' + code + '...');
-  peer = new Peer(CFG);
-
-  peer.on('open', () => {
-    log('Сервер найден, соединяюсь с хостом...');
-    const c = peer.connect(PREFIX + code, { reliable: true });
-    const timer = setTimeout(() => {
-      S.error = 'Не удалось установить соединение. Попробуйте другую сеть.';
-      log('Таймаут: канал не открылся');
-    }, 15000);
-    c.on('open', () => {
-      clearTimeout(timer); conn = c; S.connected = true; S.status = 'lobby';
-      log('Подключено к хосту!');
-    });
-    c.on('data', onData);
-    c.on('close', () => { S.connected = false; log('Соединение с хостом потеряно'); });
-  });
-  peer.on('error', e => {
-    S.error = e.type === 'peer-unavailable' ? 'Комната с таким кодом не найдена' : 'Ошибка: ' + e.type;
-    if (S.status === 'menu') S.role = null;
-    log('Ошибка: ' + e.type);
+  connectBroker(code, () => {
+    let tries = 0;
+    send({ t: 'HELLO' });
+    const t = setInterval(() => {
+      if (S.connected) return clearInterval(t);
+      if (++tries > 6) { clearInterval(t); return failStart('Комната не найдена или хост не в сети'); }
+      send({ t: 'HELLO' });
+    }, 1500);
   });
 }
 
 // ---------- Получение сообщений ----------
+function receive(d) {
+  if (d.from === ME || d.r === S.role) return;
+
+  if (S.role === 'host') {
+    if (d.t === 'HELLO') {
+      if (!guestId || guestId === d.from || !S.connected) {
+        guestId = d.from; S.connected = true; lastSeen = Date.now();
+        send({ t: 'WELCOME', to: d.from });
+        send({ t: 'READY', role: 'host', ready: S.hostReady });
+        log('Игрок 2 подключился!');
+      }
+      return;
+    }
+    if (d.from !== guestId) return;
+  } else {
+    if (d.to && d.to !== ME) return;
+    if (d.t === 'WELCOME') {
+      S.connected = true; S.status = 'lobby'; lastSeen = Date.now();
+      log('Подключено к хосту!');
+      return;
+    }
+    if (S.status === 'menu') return;
+  }
+
+  lastSeen = Date.now();
+  if (!S.connected) { S.connected = true; log('Связь восстановлена'); }
+  if (d.t === 'PING') return;
+  onData(d);
+}
+
 function onData(d) {
   if (d.t === 'READY') {
     if (d.role === 'host') S.hostReady = d.ready; else S.guestReady = d.ready;
