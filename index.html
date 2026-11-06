@@ -209,7 +209,7 @@ function check() {
   });
   S.marks = r; S.attempts++;
   const won = r.every(x => x === 'correct');
-  if (won || S.attempts >= 6) S.status = won ? 'won' : 'lost';
+  if (won) S.status = 'won';
   send({ t: 'INPUT', input: S.letters, marks: r, attempts: S.attempts });
   if (S.status !== 'playing') send({ t: 'OVER', result: S.status, attempts: S.attempts });
   render();
@@ -296,7 +296,7 @@ function render() {
     }
     h += `<div class="flex flex-col items-center gap-4">
       <div class="w-full flex justify-between text-xs text-slate-400 px-2">
-        <span>Попытки: <b class="text-cyan-400 text-sm">${S.attempts} / 6</b></span>
+        <span>Попытки: <b class="text-cyan-400 text-sm">${S.attempts}</b></span>
         ${!isGuest ? `<span>Загадано: <b class="text-emerald-400 font-mono">${esc(S.word)}</b></span>` : ''}
       </div>
       <div class="flex justify-center gap-1.5 w-full">${cells}</div>`;
