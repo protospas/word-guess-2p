@@ -15,8 +15,8 @@
   <!-- Babel for JSX compilation -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <!-- PeerJS for free & instant P2P WebRTC connection without backend -->
-  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <!-- PubNub SDK for reliable & instant WebSocket network connection -->
+  <script src="https://cdn.pubnub.com/sdk/javascript/pubnub.7.2.2.min.js"></script>
   
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
@@ -37,10 +37,18 @@
       ['Я', 'Ч', 'С', 'М', 'И', 'Т', 'Ь', 'Б', 'Ю']
     ];
 
+    // Открытый бесплатный ключ PubNub
+    const pubnub = new PubNub({
+      publishKey: 'pub-c-8a160eb8-7d84-48ff-[DEFAULT_KEY]',
+      subscribeKey: 'sub-c-5e60ee5e-6363-455b-b5cb-f926ce467df8',
+      userId: 'user_' + Math.random().toString(36).substring(2, 8)
+    });
+
     function App() {
       const [roomId, setRoomId] = useState('');
-      const [role, setRole] = useState(null); // 'host' | 'guest' | 'local'
-      const [peerConnected, setPeerConnected] = useState(false);
+      const [inputRoomCode, setInputRoomCode] = useState('');
+      const [role, setRole] = useState(null); // 'host' | 'guest' | null
+      const [isConnected, setIsConnected] = useState(false);
       const [hostReady, setHostReady] = useState(false);
       const [guestReady, setGuestReady] = useState(false);
       
@@ -50,7 +58,7 @@
         checkedStates: [],
         attempts: 0,
         maxAttempts: 6,
-        status: 'lobby', // Изменено: Начинаем сразу с 'lobby' вместо 'setup'
+        status: 'select_room', // 'select_room', 'lobby', 'setup', 'playing', 'won', 'lost'
         wordLength: 5
       });
 
@@ -61,128 +69,121 @@
       const [copied, setCopied] = useState(false);
       const [errorMessage, setErrorMessage] = useState('');
 
-      const peerRef = useRef(null);
-      const connRef = useRef(null);
+      const stateRef = useRef({ roomData, hostReady, guestReady, role });
+      useEffect(() => {
+        stateRef.current = { roomData, hostReady, guestReady, role };
+      }, [roomData, hostReady, guestReady, role]);
 
-      // Инициализация WebRTC P2P соединения
+      // Подключение по хэшу из URL если он есть
       useEffect(() => {
         const hash = window.location.hash.replace('#', '').trim().toUpperCase();
-        
-        if (hash && hash.startsWith('GUEST-')) {
-          const hostPeerId = hash.replace('GUEST-', '');
-          setRole('guest');
-          setRoomId(hostPeerId);
-
-          try {
-            const peer = new Peer();
-            peerRef.current = peer;
-
-            peer.on('open', () => {
-              const conn = peer.connect(hostPeerId);
-              connRef.current = conn;
-
-              conn.on('open', () => {
-                setPeerConnected(true);
-                // Отправляем сигнал хосту, что гость зашел в комнату
-                conn.send({ type: 'GUEST_JOINED' });
-              });
-
-              conn.on('data', (data) => {
-                if (data.type === 'SYNC_STATE') {
-                  setRoomData(data.state);
-                  setHostReady(data.hostReady || false);
-                  setGuestReady(data.guestReady || false);
-                  if (data.state.checkedStates && data.state.checkedStates.length > 0) {
-                    setLetterStatuses(data.state.checkedStates);
-                  }
-                } else if (data.type === 'RESET') {
-                  handleResetLocalState();
-                }
-              });
-            });
-
-            peer.on('error', () => {
-              setRole('local');
-            });
-          } catch(e) {
-            setRole('local');
-          }
-
-        } else {
-          setRole('host');
-          const randomId = 'WD-' + Math.random().toString(36).substring(2, 7).toUpperCase();
-          setRoomId(randomId);
-
-          try {
-            const peer = new Peer(randomId);
-            peerRef.current = peer;
-
-            peer.on('open', (id) => {
-              window.location.hash = 'GUEST-' + id;
-            });
-
-            peer.on('connection', (conn) => {
-              connRef.current = conn;
-              setPeerConnected(true);
-
-              conn.on('data', (data) => {
-                if (data.type === 'GUEST_JOINED') {
-                  // При подключении гостя высылаем ему текущее состояние комнаты
-                  sendStateToGuest(roomData, hostReady, guestReady);
-                } else if (data.type === 'GUEST_TOGGLE_READY') {
-                  setGuestReady(prev => {
-                    const next = !prev;
-                    sendStateToGuest(roomData, hostReady, next);
-                    return next;
-                  });
-                } else if (data.type === 'GUEST_INPUT') {
-                  setRoomData(prev => ({
-                    ...prev,
-                    currentInput: data.input
-                  }));
-                } else if (data.type === 'GUEST_CHECK') {
-                  handleCheckGuestWord(data.guess, conn);
-                }
-              });
-            });
-
-            peer.on('error', () => {
-              setRole('local');
-            });
-          } catch(e) {
-            setRole('local');
-          }
+        if (hash) {
+          joinRoomAsGuest(hash);
         }
-
-        return () => {
-          if (peerRef.current) peerRef.current.destroy();
-        };
       }, []);
 
-      const sendStateToGuest = (stateObj, hReady = hostReady, gReady = guestReady) => {
-        if (connRef.current && connRef.current.open) {
-          connRef.current.send({
+      // Создать новую комнату (Игрок 1)
+      const createNewRoom = () => {
+        const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+        setRoomId(code);
+        setRole('host');
+        window.location.hash = code;
+        initPubNub(code, 'host');
+      };
+
+      // Войти в комнату по коду (Игрок 2)
+      const joinRoomAsGuest = (codeToJoin) => {
+        const code = (codeToJoin || inputRoomCode).trim().toUpperCase();
+        if (!code) {
+          setErrorMessage('Введите код комнаты!');
+          return;
+        }
+        setErrorMessage('');
+        setRoomId(code);
+        setRole('guest');
+        window.location.hash = code;
+        initPubNub(code, 'guest');
+      };
+
+      // Инициализация WebSocket сокетов PubNub
+      const initPubNub = (channelId, userRole) => {
+        pubnub.unsubscribeAll();
+
+        pubnub.addListener({
+          status: (s) => {
+            if (s.category === "PNConnectedCategory") {
+              setIsConnected(true);
+              if (userRole === 'guest') {
+                pubnub.publish({
+                  channel: channelId,
+                  message: { type: 'GUEST_JOINED' }
+                });
+              }
+            }
+          },
+          message: (m) => {
+            const msg = m.message;
+
+            if (msg.type === 'SYNC_STATE') {
+              setRoomData(msg.state);
+              setHostReady(msg.hostReady);
+              setGuestReady(msg.guestReady);
+              if (msg.state.checkedStates && msg.state.checkedStates.length > 0) {
+                setLetterStatuses(msg.state.checkedStates);
+              }
+            } else if (msg.type === 'GUEST_JOINED') {
+              setIsConnected(true);
+              if (userRole === 'host') {
+                broadcastState(stateRef.current.roomData, stateRef.current.hostReady, stateRef.current.guestReady, channelId);
+              }
+            } else if (msg.type === 'TOGGLE_READY') {
+              if (userRole === 'host') {
+                if (msg.role === 'guest') {
+                  const nextGuest = !stateRef.current.guestReady;
+                  setGuestReady(nextGuest);
+                  broadcastState(stateRef.current.roomData, stateRef.current.hostReady, nextGuest, channelId);
+                }
+              }
+            } else if (msg.type === 'GUEST_INPUT') {
+              if (userRole === 'host') {
+                setRoomData(prev => ({ ...prev, currentInput: msg.input }));
+              }
+            } else if (msg.type === 'GUEST_CHECK') {
+              if (userRole === 'host') {
+                handleCheckGuestWord(msg.guess, channelId);
+              }
+            } else if (msg.type === 'RESET') {
+              handleResetLocalState();
+            }
+          }
+        });
+
+        pubnub.subscribe({ channels: [channelId] });
+        setRoomData(prev => ({ ...prev, status: 'lobby' }));
+      };
+
+      const broadcastState = (stateObj, hReady, gReady, channel = roomId) => {
+        pubnub.publish({
+          channel: channel,
+          message: {
             type: 'SYNC_STATE',
             state: stateObj,
             hostReady: hReady,
             guestReady: gReady
-          });
-        }
+          }
+        });
       };
 
-      // Проверка на запуск этапа загадывания (Оба игрока подключены и готовы)
+      // Переход из Лобби в Загадывание слова
       useEffect(() => {
-        if (role === 'host' && hostReady && (guestReady || role === 'local') && roomData.status === 'lobby') {
-          const setupState = {
-            ...roomData,
-            status: 'setup' // Оба готовы -> Переходим к загадыванию слова!
-          };
+        if (role === 'host' && hostReady && guestReady && roomData.status === 'lobby') {
+          const setupState = { ...roomData, status: 'setup' };
           setRoomData(setupState);
-          sendStateToGuest(setupState, true, true);
+          broadcastState(setupState, true, true);
         }
       }, [hostReady, guestReady, role, roomData.status]);
 
-      // Загадывание слова Ведущим (После того как оба готовы)
+      // Установка загаданного слова (Игрок 1)
       const handleSetSecretWord = (e) => {
         e.preventDefault();
         const cleanWord = secretInput.trim().toUpperCase();
@@ -205,38 +206,33 @@
           checkedStates: initialStatuses,
           attempts: 0,
           maxAttempts: 6,
-          status: 'playing', // Переходим сразу в саму игру!
+          status: 'playing',
           wordLength: cleanWord.length
         };
 
         setRoomData(newState);
-        sendStateToGuest(newState, true, true);
+        broadcastState(newState, true, true);
       };
 
-      // Гость/Хост нажимает "Готов" в Лобби
       const handleToggleHostReady = () => {
         if (role === 'host') {
-          setHostReady(prev => {
-            const next = !prev;
-            sendStateToGuest(roomData, next, guestReady);
-            return next;
-          });
+          const next = !hostReady;
+          setHostReady(next);
+          broadcastState(roomData, next, guestReady);
         }
       };
 
       const handleToggleGuestReady = () => {
         if (role === 'guest') {
-          if (connRef.current && connRef.current.open) {
-            connRef.current.send({ type: 'GUEST_TOGGLE_READY' });
-          }
-        } else if (role === 'local') {
-          setHostReady(true);
-          setGuestReady(true);
+          pubnub.publish({
+            channel: roomId,
+            message: { type: 'TOGGLE_READY', role: 'guest' }
+          });
         }
       };
 
-      // Проверка слова Гостя
-      const handleCheckGuestWord = (guess, conn) => {
+      // Алгоритм проверки слова Wordle
+      const handleCheckGuestWord = (guess, channel) => {
         setRoomData((prev) => {
           const target = prev.secretWord.split('');
           const guessArr = guess.split('');
@@ -273,15 +269,7 @@
             status: newStatus
           };
 
-          if (conn && conn.open) {
-            conn.send({
-              type: 'SYNC_STATE',
-              state: updatedState,
-              hostReady: true,
-              guestReady: true
-            });
-          }
-
+          broadcastState(updatedState, true, true, channel);
           return updatedState;
         });
       };
@@ -311,10 +299,10 @@
           setActiveCellIndex(targetIndex + 1);
         }
 
-        if (role === 'guest' && connRef.current && connRef.current.open) {
-          connRef.current.send({
-            type: 'GUEST_INPUT',
-            input: newLetters.join('')
+        if (role === 'guest') {
+          pubnub.publish({
+            channel: roomId,
+            message: { type: 'GUEST_INPUT', input: newLetters.join('') }
           });
         }
       };
@@ -337,10 +325,10 @@
         setLetterStatuses(newStatuses);
         setActiveCellIndex(targetIndex);
 
-        if (role === 'guest' && connRef.current && connRef.current.open) {
-          connRef.current.send({
-            type: 'GUEST_INPUT',
-            input: newLetters.join('')
+        if (role === 'guest') {
+          pubnub.publish({
+            channel: roomId,
+            message: { type: 'GUEST_INPUT', input: newLetters.join('') }
           });
         }
       };
@@ -361,13 +349,13 @@
         }
         setErrorMessage('');
 
-        if (role === 'guest' && connRef.current && connRef.current.open) {
-          connRef.current.send({
-            type: 'GUEST_CHECK',
-            guess: guess
+        if (role === 'guest') {
+          pubnub.publish({
+            channel: roomId,
+            message: { type: 'GUEST_CHECK', guess: guess }
           });
-        } else if (role === 'local' || role === 'host') {
-          handleCheckGuestWord(guess, connRef.current);
+        } else if (role === 'host') {
+          handleCheckGuestWord(guess, roomId);
         }
       };
 
@@ -399,7 +387,7 @@
           checkedStates: [],
           attempts: 0,
           maxAttempts: 6,
-          status: 'lobby', // Возврат в Лобби при новой игре
+          status: 'lobby',
           wordLength: 5
         });
         setSecretInput('');
@@ -411,18 +399,16 @@
 
       const handleFullRestart = () => {
         handleResetLocalState();
-        if (role === 'host' && connRef.current && connRef.current.open) {
-          connRef.current.send({ type: 'RESET' });
+        if (role === 'host') {
+          pubnub.publish({
+            channel: roomId,
+            message: { type: 'RESET' }
+          });
         }
       };
 
-      const startLocalDemo = () => {
-        setRole('local');
-        handleResetLocalState();
-      };
-
       const copyRoomLink = () => {
-        const url = window.location.href;
+        const url = `${window.location.origin}${window.location.pathname}#${roomId}`;
         navigator.clipboard.writeText(url);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
@@ -461,34 +447,34 @@
                 <h1 className="text-xl sm:text-2xl font-black tracking-wider bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
                   WORD DUEL
                 </h1>
-                <p className="text-xs text-slate-400">P2P Игра в слова на двоих</p>
+                <p className="text-xs text-slate-400">Онлайн дуэль слов на двоих</p>
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 bg-slate-900/90 border border-slate-800 p-2 rounded-xl text-xs">
-              <div className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800 rounded-lg text-slate-300 font-medium">
-                <span className={`w-2 h-2 rounded-full ${peerConnected || role === 'local' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
-                <span>{role === 'host' ? 'Игрок 1 (Загадывает)' : role === 'guest' ? 'Игрок 2 (Угадывает)' : 'Локальный Режим'}</span>
-              </div>
-              
-              {role !== 'local' && (
+            {role && (
+              <div className="flex flex-wrap items-center gap-2 bg-slate-900/90 border border-slate-800 p-2 rounded-xl text-xs">
+                <div className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-800 rounded-lg text-slate-300 font-medium">
+                  <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
+                  <span>{role === 'host' ? 'Игрок 1 (Загадывает)' : 'Игрок 2 (Угадывает)'}</span>
+                </div>
+                
                 <button 
                   onClick={copyRoomLink}
                   className="flex items-center gap-1.5 px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-semibold transition active:scale-95 shadow-sm"
                 >
                   <i data-lucide={copied ? "check" : "copy"} class="w-3.5 h-3.5"></i>
-                  <span>{copied ? 'Скопировано!' : 'Ссылка на комнату'}</span>
+                  <span>{copied ? 'Скопировано!' : `Код: ${roomId}`}</span>
                 </button>
-              )}
 
-              <button 
-                onClick={handleFullRestart}
-                className="px-2.5 py-1 bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white rounded-lg transition"
-                title="Новая игра"
-              >
-                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
-              </button>
-            </div>
+                <button 
+                  onClick={handleFullRestart}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-rose-600 text-slate-300 hover:text-white rounded-lg transition"
+                  title="Сбросить / Новая игра"
+                >
+                  <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                </button>
+              </div>
+            )}
           </header>
 
           {errorMessage && (
@@ -501,6 +487,52 @@
           {/* Main Area */}
           <main className="w-full max-w-xl flex-1 flex flex-col justify-center items-center my-4 gap-6">
 
+            {/* ЭКРАН ВЫБОРА / ВВОДА КОДА КОМНАТЫ */}
+            {roomData.status === 'select_room' && (
+              <div className="w-full bg-slate-900/90 border border-slate-800 p-6 rounded-3xl shadow-2xl flex flex-col items-center gap-6 text-center">
+                <div className="p-4 bg-cyan-500/10 text-cyan-400 rounded-full">
+                  <i data-lucide="gamepad-2" class="w-10 h-10"></i>
+                </div>
+                <div>
+                  <h2 className="text-2xl font-black text-white">ОНЛАЙН ДУЭЛЬ</h2>
+                  <p className="text-xs text-slate-400 mt-1">Создайте комнату или войти по ключу друга</p>
+                </div>
+
+                <div className="w-full flex flex-col gap-4 max-w-sm">
+                  <button
+                    onClick={createNewRoom}
+                    className="w-full py-4 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold text-base rounded-2xl shadow-lg shadow-cyan-500/25 transition active:scale-95 flex items-center justify-center gap-2"
+                  >
+                    <i data-lucide="plus-circle" class="w-5 h-5"></i>
+                    <span>Создать новую комнату</span>
+                  </button>
+
+                  <div className="flex items-center gap-2 my-1">
+                    <div className="h-[1px] bg-slate-800 flex-1"></div>
+                    <span className="text-xs text-slate-500 font-bold uppercase">или войти по ключу</span>
+                    <div className="h-[1px] bg-slate-800 flex-1"></div>
+                  </div>
+
+                  <div className="flex gap-2">
+                    <input 
+                      type="text" 
+                      value={inputRoomCode}
+                      onChange={(e) => setInputRoomCode(e.target.value.toUpperCase())}
+                      placeholder="КОД (НАПР. ABC12)"
+                      maxLength={7}
+                      className="flex-1 bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded-xl p-3 text-center text-lg font-bold tracking-wider text-white uppercase outline-none"
+                    />
+                    <button
+                      onClick={() => joinRoomAsGuest()}
+                      className="px-5 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl transition"
+                    >
+                      Войти
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* ЭКРАН 1: ЛОББИ ПОДКЛЮЧЕНИЯ И ГОТОВНОСТИ */}
             {roomData.status === 'lobby' && (
               <div className="w-full bg-slate-900/90 border border-slate-800 p-6 rounded-3xl shadow-2xl flex flex-col items-center gap-6 text-center">
@@ -508,9 +540,9 @@
                   <i data-lucide="users" class="w-8 h-8"></i>
                 </div>
                 <div>
-                  <h2 className="text-xl font-black tracking-wide text-white">ШАГ 1: ЛОББИ ИГРОКОВ</h2>
+                  <h2 className="text-xl font-black tracking-wide text-white">КОМНАТА: <span className="text-cyan-400">{roomId}</span></h2>
                   <p className="text-xs text-slate-400 mt-1">
-                    Скопируйте ссылку сверху и отправьте другу. Как только оба подтвердят готовность, Игрок 1 сможет загадать слово!
+                    Передайте этот код другу или отправьте ссылку. Как только оба подтвердят готовность, Игрок 1 загадает слово!
                   </p>
                 </div>
 
@@ -526,7 +558,7 @@
                   <div className={`p-4 rounded-2xl border flex flex-col items-center gap-2 transition ${guestReady ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}`}>
                     <i data-lucide={guestReady ? "check-circle-2" : "circle"} class="w-8 h-8"></i>
                     <span className="text-xs font-bold">Игрок 2 (Отгадывает)</span>
-                    <span className="text-[10px] uppercase font-bold tracking-wider">{guestReady ? 'Подключен & Готов ✓' : peerConnected ? 'В комнате...' : 'Ожидание входа...'}</span>
+                    <span className="text-[10px] uppercase font-bold tracking-wider">{guestReady ? 'Готов ✓' : 'Входит в комнату...'}</span>
                   </div>
                 </div>
 
@@ -557,27 +589,18 @@
                     <span>{guestReady ? 'Отменить готовность' : 'Я ГОТОВ ИГРАТЬ!'}</span>
                   </button>
                 )}
-
-                {role === 'local' && (
-                  <button
-                    onClick={handleToggleGuestReady}
-                    className="w-full max-w-md py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-2xl"
-                  >
-                    Начать тест (Соло / 2 игрока на 1 ПК)
-                  </button>
-                )}
               </div>
             )}
 
-            {/* ЭКРАН 2: Ведущий загадывает слово (ПОСЛЕ подключения в лобби) */}
-            {(role === 'host' || role === 'local') && roomData.status === 'setup' && (
+            {/* ЭКРАН 2: Ведущий загадывает слово */}
+            {role === 'host' && roomData.status === 'setup' && (
               <div className="w-full bg-slate-900/80 border border-slate-800 p-6 rounded-3xl shadow-2xl backdrop-blur-md flex flex-col gap-5 text-center">
                 <div className="inline-flex p-3 bg-emerald-500/10 text-emerald-400 rounded-full mx-auto">
                   <i data-lucide="keyboard" class="w-8 h-8"></i>
                 </div>
                 <div>
-                  <h2 className="text-lg sm:text-xl font-bold">ШАГ 2: Загадайте слово</h2>
-                  <p className="text-xs text-slate-400 mt-1">От 3 до 10 букв. Игрок 2 сходу получит игровое поле!</p>
+                  <h2 className="text-lg sm:text-xl font-bold">Оба готовы! Загадайте слово</h2>
+                  <p className="text-xs text-slate-400 mt-1">От 3 до 10 букв на русском языке</p>
                 </div>
 
                 <form onSubmit={handleSetSecretWord} className="flex flex-col gap-4">
@@ -595,13 +618,13 @@
                     className="w-full py-4 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-bold text-base rounded-2xl shadow-lg shadow-emerald-500/25 transition active:scale-[0.98] flex items-center justify-center gap-2"
                   >
                     <i data-lucide="play" class="w-5 h-5"></i>
-                    <span>Загадать слово и Начать Играть!</span>
+                    <span>Загадать слово и Начать!</span>
                   </button>
                 </form>
               </div>
             )}
 
-            {/* ЭКРАН 2 (Гость ждет пока Игрок 1 напишет слово) */}
+            {/* ЭКРАН 2 (Ожидание ввода) */}
             {role === 'guest' && roomData.status === 'setup' && (
               <div className="w-full bg-slate-900/80 border border-slate-800 p-8 rounded-3xl text-center flex flex-col items-center gap-4">
                 <div className="p-4 bg-cyan-500/10 rounded-full text-cyan-400 animate-pulse">
@@ -609,12 +632,12 @@
                 </div>
                 <h2 className="text-xl font-bold">Игрок 1 пишет слово...</h2>
                 <p className="text-xs text-slate-400 max-w-xs">
-                  Оба игрока подтвердили готовность! Как только Игрок 1 нажмет «Начать», у вас откроются ячейки для отгадывания.
+                  Оба подтвердили готовность. Как только Игрок 1 отправит слово, игра сразу начнется!
                 </p>
               </div>
             )}
 
-            {/* ЭКРАН 3: Процесс игры */}
+            {/* ЭКРАН 3: Игровой процесс */}
             {(roomData.status === 'playing' || roomData.status === 'won' || roomData.status === 'lost') && (
               <div className="w-full flex flex-col items-center gap-6">
 
@@ -624,7 +647,7 @@
                     <span className="text-base font-bold text-cyan-400">{roomData.attempts} / {roomData.maxAttempts}</span>
                   </div>
 
-                  {(role === 'host' || role === 'local') && (
+                  {role === 'host' && (
                     <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl text-xs">
                       <span className="text-slate-400">Загадано:</span>
                       <span className="font-bold text-emerald-400 tracking-wider">{roomData.secretWord}</span>
@@ -632,13 +655,13 @@
                   )}
                 </div>
 
-                {/* Единая строка ячеек */}
+                {/* Строка ячеек */}
                 <div className="flex justify-center items-center gap-1.5 sm:gap-2.5 w-full py-4">
                   {Array.from({ length: roomData.wordLength }).map((_, index) => {
                     let letter = '';
                     let status = 'none';
 
-                    if (role === 'guest' || role === 'local') {
+                    if (role === 'guest') {
                       letter = inputLetters[index] || '';
                       status = letterStatuses[index] || 'none';
                     } else {
@@ -646,13 +669,13 @@
                       status = (roomData.checkedStates || [])[index] || 'none';
                     }
 
-                    const isActive = (role === 'guest' || role === 'local') && index === activeCellIndex && roomData.status === 'playing';
+                    const isActive = role === 'guest' && index === activeCellIndex && roomData.status === 'playing';
 
                     return (
                       <button
                         key={index}
                         onClick={() => handleCellClick(index)}
-                        disabled={roomData.status !== 'playing'}
+                        disabled={role !== 'guest' || roomData.status !== 'playing'}
                         className={`w-11 h-14 sm:w-14 sm:h-18 ${getCellColorClass(status, isActive)} cursor-pointer`}
                       >
                         {letter}
@@ -676,7 +699,7 @@
                   </div>
                 </div>
 
-                {/* Победа */}
+                {/* Результаты */}
                 {roomData.status === 'won' && (
                   <div className="w-full bg-emerald-950/60 border border-emerald-500/40 p-5 rounded-2xl text-center flex flex-col items-center gap-3 shadow-xl">
                     <h3 className="text-xl font-black text-emerald-300">
@@ -695,7 +718,6 @@
                   </div>
                 )}
 
-                {/* Поражение */}
                 {roomData.status === 'lost' && (
                   <div className="w-full bg-rose-950/60 border border-rose-500/40 p-5 rounded-2xl text-center flex flex-col items-center gap-3 shadow-xl">
                     <h3 className="text-xl font-black text-rose-400">ПОПЫТКИ ЗАКАНЧАЛИСЬ! 😞</h3>
@@ -713,7 +735,7 @@
                 )}
 
                 {/* Клавиатура */}
-                {(role === 'guest' || role === 'local') && roomData.status === 'playing' && (
+                {role === 'guest' && roomData.status === 'playing' && (
                   <div className="w-full flex flex-col gap-1.5 mt-2 select-none">
                     {KEYBOARD_ROWS.map((row, rIdx) => (
                       <div key={rIdx} className="flex justify-center gap-1 sm:gap-1.5">
@@ -751,7 +773,7 @@
           </main>
 
           <footer className="w-full max-w-2xl border-t border-slate-800/60 pt-3 text-center text-[11px] text-slate-500">
-            Word Duel — P2P WebRTC Игра в слова на двоих
+            Word Duel — Онлайн Игра в слова на двоих
           </footer>
         </div>
       );
