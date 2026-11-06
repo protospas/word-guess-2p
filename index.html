@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Word Duel — Дуэль Слов Online</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>Word Duel — P2P Online</title>
 
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -12,8 +15,8 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 
-  <!-- MQTT client via WebSockets (Бесплатный открытый протокол без API-ключей) -->
-  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <!-- PeerJS (Стабильное прямое WebRTC P2P соединение браузер-браузер) -->
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
@@ -32,13 +35,10 @@
       ['Я', 'Ч', 'С', 'М', 'И', 'Т', 'Ь', 'Б', 'Ю']
     ];
 
-    // Открытый публичный WSS брокер HiveMQ (работает везде, без лимитов и ключей)
-    const MQTT_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
-
     function App() {
       const [roomId, setRoomId] = useState('');
       const [inputRoomCode, setInputRoomCode] = useState('');
-      const [role, setRole] = useState(null);
+      const [role, setRole] = useState(null); // 'host' | 'guest'
       const [connected, setConnected] = useState(false);
       
       const [hostReady, setHostReady] = useState(false);
@@ -46,7 +46,7 @@
 
       const [secretWord, setSecretWord] = useState('');
       const [wordLength, setWordLength] = useState(5);
-      const [status, setStatus] = useState('menu');
+      const [status, setStatus] = useState('menu'); // 'menu', 'lobby', 'setup', 'playing', 'won', 'lost'
       
       const [inputLetters, setInputLetters] = useState([]);
       const [letterStatuses, setLetterStatuses] = useState([]);
@@ -61,94 +61,116 @@
       const [errorMessage, setErrorMessage] = useState('');
       const [logs, setLogs] = useState([]);
 
-      const clientRef = useRef(null);
-      const myIdRef = useRef('user_' + Math.random().toString(36).substring(2, 8));
+      const peerRef = useRef(null);
+      const connRef = useRef(null);
 
       const addLog = (msg) => {
-        console.log(`[LOG] ${msg}`);
+        console.log(`[P2P LOG] ${msg}`);
         setLogs(prev => [msg, ...prev.slice(0, 5)]);
       };
 
       const sendSignal = (payload) => {
-        if (clientRef.current && clientRef.current.connected && roomId) {
-          const topic = `word-duel-game-v1/${roomId}`;
-          const msg = JSON.stringify({ senderId: myIdRef.current, ...payload });
-          clientRef.current.publish(topic, msg);
+        if (connRef.current && connRef.current.open) {
+          connRef.current.send(payload);
         }
       };
 
-      const connectToRoom = (code, myRole) => {
-        const cleanCode = code.trim().toUpperCase();
-        if (!cleanCode) return;
+      // Инициализация Хоста (Создатель комнаты)
+      const handleCreateRoom = () => {
+        const code = Math.random().toString(36).substring(2, 7).toUpperCase();
+        const peerId = `word-duel-p2p-${code}`;
 
-        setRoomId(cleanCode);
-        setRole(myRole);
-        window.location.hash = cleanCode;
+        setRoomId(code);
+        setRole('host');
+        window.location.hash = code;
 
-        if (clientRef.current) {
-          try { clientRef.current.end(); } catch(e) {}
-        }
+        addLog(`Создаем комнату P2P (${code})...`);
+        const peer = new Peer(peerId);
+        peerRef.current = peer;
 
-        addLog(`Подключение к HiveMQ (${cleanCode})...`);
-        const client = mqtt.connect(MQTT_BROKER, {
-          clientId: myIdRef.current,
-          keepalive: 60,
-          clean: true
-        });
-
-        clientRef.current = client;
-
-        client.on('connect', () => {
+        peer.on('open', (id) => {
           setConnected(true);
           setStatus('lobby');
-          addLog("Сеть подключена! Входим в канал...");
+          addLog(`Комната готова! Код: ${code}`);
+        });
 
-          const topic = `word-duel-game-v1/${cleanCode}`;
-          client.subscribe(topic, (err) => {
-            if (!err) {
-              addLog(`Канал ${cleanCode} активен`);
-              setTimeout(() => {
-                sendSignal({ type: 'JOIN', role: myRole });
-              }, 300);
-            }
+        peer.on('connection', (conn) => {
+          connRef.current = conn;
+          addLog("Игрок 2 подключился!");
+          setConnected(true);
+
+          conn.on('data', (data) => {
+            handleIncomingData(data, 'host');
+          });
+
+          conn.on('close', () => {
+            setConnected(false);
+            addLog("Игрок 2 отключился");
           });
         });
 
-        client.on('message', (topic, message) => {
-          try {
-            const data = JSON.parse(message.toString());
-            // Игнорируем свои же собственные сообщения
-            if (data.senderId === myIdRef.current) return;
+        peer.on('error', (err) => {
+          addLog(`Ошибка Peer: ${err.type}`);
+        });
+      };
 
-            handleIncomingSignal(data, myRole);
-          } catch (e) {
-            console.error(e);
-          }
+      // Инициализация Гостя (Вход по коду)
+      const connectAsGuest = (code) => {
+        const cleanCode = code.trim().toUpperCase();
+        if (!cleanCode) return;
+
+        const targetPeerId = `word-duel-p2p-${cleanCode}`;
+        setRoomId(cleanCode);
+        setRole('guest');
+        window.location.hash = cleanCode;
+
+        addLog(`Подключаемся к хосту ${cleanCode}...`);
+        const peer = new Peer();
+        peerRef.current = peer;
+
+        peer.on('open', () => {
+          const conn = peer.connect(targetPeerId);
+          connRef.current = conn;
+
+          conn.on('open', () => {
+            setConnected(true);
+            setStatus('lobby');
+            addLog("Успешно подключено к Хосту!");
+            sendSignal({ type: 'JOIN' });
+          });
+
+          conn.on('data', (data) => {
+            handleIncomingData(data, 'guest');
+          });
+
+          conn.on('close', () => {
+            setConnected(false);
+            addLog("Соединение с хостом потеряно");
+          });
         });
 
-        client.on('error', (err) => {
-          addLog("Ошибка сокета HiveMQ");
+        peer.on('error', (err) => {
+          addLog(`Ошибка подключения: ${err.type}`);
+          setErrorMessage("Не удалось найти комнату с таким кодом!");
         });
+      };
 
-        client.on('close', () => {
-          setConnected(false);
-          addLog("Соединение закрыто");
-        });
+      const handleJoinByCode = (e) => {
+        e.preventDefault();
+        connectAsGuest(inputRoomCode);
       };
 
       useEffect(() => {
         const hash = window.location.hash.replace('#', '').trim().toUpperCase();
         if (hash) {
-          connectToRoom(hash, 'guest');
+          connectAsGuest(hash);
         }
       }, []);
 
-      const handleIncomingSignal = (data, myRole) => {
+      const handleIncomingData = (data, myRole) => {
         switch (data.type) {
           case 'JOIN':
-            addLog(`Второй игрок вошел!`);
-            if (myRole === 'host' && hostReady) sendSignal({ type: 'READY_STATE', role: 'host', ready: true });
-            if (myRole === 'guest' && guestReady) sendSignal({ type: 'READY_STATE', role: 'guest', ready: true });
+            addLog("Второй игрок в лобби");
             break;
 
           case 'READY_STATE':
@@ -192,9 +214,6 @@
             setRemoteGuestStatuses([]);
             setAttempts(0);
             break;
-
-          default:
-            break;
         }
       };
 
@@ -218,18 +237,6 @@
           }
         }
       }, [hostReady, guestReady, status, role]);
-
-      const handleCreateRoom = () => {
-        const newCode = Math.random().toString(36).substring(2, 7).toUpperCase();
-        connectToRoom(newCode, 'host');
-      };
-
-      const handleJoinByCode = (e) => {
-        e.preventDefault();
-        if (inputRoomCode.trim()) {
-          connectToRoom(inputRoomCode.trim(), 'guest');
-        }
-      };
 
       const handleSetSecretWord = (e) => {
         e.preventDefault();
@@ -318,7 +325,6 @@
         const results = Array(wordLength).fill('absent');
         const targetTaken = Array(wordLength).fill(false);
 
-        // 1. Зеленые
         guessArr.forEach((char, idx) => {
           if (char === target[idx]) {
             results[idx] = 'correct';
@@ -326,7 +332,6 @@
           }
         });
 
-        // 2. Желтые
         guessArr.forEach((char, idx) => {
           if (results[idx] !== 'correct') {
             const found = target.findIndex((tChar, tIdx) => tChar === char && !targetTaken[tIdx]);
@@ -406,8 +411,8 @@
           // MENU
           status === 'menu' && React.createElement('div', { className: 'bg-slate-900/80 border border-slate-800 p-6 rounded-3xl shadow-2xl flex flex-col gap-6 text-center' },
             React.createElement('div', null,
-              React.createElement('h2', { className: 'text-2xl font-black' }, 'Онлайн Дуэль'),
-              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Играйте с другом 1 на 1 по сети')
+              React.createElement('h2', { className: 'text-2xl font-black' }, 'Онлайн P2P Дуэль'),
+              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Прямое соединение без сторонних серверов')
             ),
             React.createElement('div', { className: 'flex flex-col gap-3' },
               React.createElement('button', { onClick: handleCreateRoom, className: 'w-full py-4 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 font-bold rounded-2xl shadow-lg shadow-cyan-500/20 active:scale-95 transition' }, '➕ Создать новую комнату'),
@@ -432,7 +437,7 @@
           status === 'lobby' && React.createElement('div', { className: 'bg-slate-900/80 border border-slate-800 p-6 rounded-3xl text-center flex flex-col gap-5' },
             React.createElement('div', null,
               React.createElement('h2', { className: 'text-xl font-bold' }, 'Лобби комнаты: ', React.createElement('span', { className: 'font-mono text-cyan-400' }, roomId)),
-              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Оба игрока должны подтвердить готовность')
+              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Подтвердите готовность к игре')
             ),
             React.createElement('div', { className: 'grid grid-cols-2 gap-3 my-2' },
               React.createElement('div', { className: `p-4 rounded-2xl border ${hostReady ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}` },
@@ -448,7 +453,7 @@
               onClick: toggleReady,
               className: `w-full py-4 font-black rounded-2xl transition active:scale-95 shadow-lg ${(role === 'host' ? hostReady : guestReady) ? 'bg-slate-800 hover:bg-slate-700 text-slate-300' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/25'}`
             }, (role === 'host' ? hostReady : guestReady) ? 'Отменить готовность' : 'Я ГОТОВ К ИГРЕ!'),
-            React.createElement('p', { className: 'text-[11px] text-slate-500' }, 'Передайте код ', React.createElement('strong', { className: 'text-slate-300 font-mono' }, roomId), ' другу для входа.')
+            React.createElement('p', { className: 'text-[11px] text-slate-500' }, 'Отправьте ссылку или код ', React.createElement('strong', { className: 'text-slate-300 font-mono' }, roomId), ' другу.')
           ),
 
           // SETUP (HOST)
@@ -537,7 +542,7 @@
         // Footer
         React.createElement('footer', { className: 'mt-4 pt-3 border-t border-slate-800/60 text-[10px] text-slate-500 font-mono' },
           React.createElement('div', { className: 'flex justify-between items-center mb-1' },
-            React.createElement('span', null, 'Сеть HiveMQ: ', React.createElement('strong', { className: connected ? "text-emerald-400" : "text-amber-400" }, connected ? "Подключено" : "Отключено")),
+            React.createElement('span', null, 'Статус P2P: ', React.createElement('strong', { className: connected ? "text-emerald-400" : "text-amber-400" }, connected ? "Подключено" : "Отключено")),
             React.createElement('span', null, 'Роль: ', role || 'Не выбрана')
           ),
           React.createElement('div', { className: 'bg-slate-900/90 border border-slate-800 p-2 rounded-lg max-h-20 overflow-y-auto space-y-0.5' },
