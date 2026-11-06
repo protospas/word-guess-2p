@@ -12,9 +12,9 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 
-  <!-- Babel -->
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  
+  <!-- MQTT client via WebSockets (Бесплатный открытый протокол без API-ключей) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
     body { font-family: 'Inter', sans-serif; }
@@ -23,7 +23,7 @@
 <body class="bg-slate-950 text-slate-100 min-h-screen selection:bg-cyan-500 selection:text-white">
   <div id="root"></div>
 
-  <script type="text/babel">
+  <script>
     const { useState, useEffect, useRef } = React;
 
     const KEYBOARD_ROWS = [
@@ -32,13 +32,13 @@
       ['Я', 'Ч', 'С', 'М', 'И', 'Т', 'Ь', 'Б', 'Ю']
     ];
 
-    // Публичный брокер WebSocket сокетов (PieSocket Free Public Endpoint)
-    const PUBLIC_WS_RELAY = 'wss://free.piehost.com/v3/word-duel-room-1234?api_key=o75aHjN2J5N9Z0J2&notify_self=0';
+    // Открытый публичный WSS брокер HiveMQ (работает везде, без лимитов и ключей)
+    const MQTT_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
 
     function App() {
       const [roomId, setRoomId] = useState('');
       const [inputRoomCode, setInputRoomCode] = useState('');
-      const [role, setRole] = useState(null); // 'host' | 'guest'
+      const [role, setRole] = useState(null);
       const [connected, setConnected] = useState(false);
       
       const [hostReady, setHostReady] = useState(false);
@@ -46,14 +46,13 @@
 
       const [secretWord, setSecretWord] = useState('');
       const [wordLength, setWordLength] = useState(5);
-      const [status, setStatus] = useState('menu'); // 'menu', 'lobby', 'setup', 'playing', 'won', 'lost'
+      const [status, setStatus] = useState('menu');
       
       const [inputLetters, setInputLetters] = useState([]);
       const [letterStatuses, setLetterStatuses] = useState([]);
       const [activeCellIndex, setActiveCellIndex] = useState(0);
       const [attempts, setAttempts] = useState(0);
 
-      // Ввод guest для экрана host
       const [remoteGuestInput, setRemoteGuestInput] = useState('');
       const [remoteGuestStatuses, setRemoteGuestStatuses] = useState([]);
 
@@ -62,22 +61,22 @@
       const [errorMessage, setErrorMessage] = useState('');
       const [logs, setLogs] = useState([]);
 
-      const socketRef = useRef(null);
+      const clientRef = useRef(null);
+      const myIdRef = useRef('user_' + Math.random().toString(36).substring(2, 8));
 
       const addLog = (msg) => {
-        console.log(`[GAME LOG] ${msg}`);
+        console.log(`[LOG] ${msg}`);
         setLogs(prev => [msg, ...prev.slice(0, 5)]);
       };
 
-      // Отправка сообщений
       const sendSignal = (payload) => {
-        if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-          const msg = JSON.stringify({ room: roomId, ...payload });
-          socketRef.current.send(msg);
+        if (clientRef.current && clientRef.current.connected && roomId) {
+          const topic = `word-duel-game-v1/${roomId}`;
+          const msg = JSON.stringify({ senderId: myIdRef.current, ...payload });
+          clientRef.current.publish(topic, msg);
         }
       };
 
-      // Подключение по сокетам
       const connectToRoom = (code, myRole) => {
         const cleanCode = code.trim().toUpperCase();
         if (!cleanCode) return;
@@ -86,42 +85,57 @@
         setRole(myRole);
         window.location.hash = cleanCode;
 
-        if (socketRef.current) socketRef.current.close();
+        if (clientRef.current) {
+          try { clientRef.current.end(); } catch(e) {}
+        }
 
-        addLog(`Подключение к комнате ${cleanCode}...`);
-        const ws = new WebSocket(PUBLIC_WS_RELAY);
-        socketRef.current = ws;
+        addLog(`Подключение к HiveMQ (${cleanCode})...`);
+        const client = mqtt.connect(MQTT_BROKER, {
+          clientId: myIdRef.current,
+          keepalive: 60,
+          clean: true
+        });
 
-        ws.onopen = () => {
+        clientRef.current = client;
+
+        client.on('connect', () => {
           setConnected(true);
           setStatus('lobby');
-          addLog("Соединение с сервером установлено!");
-          // Оповещаем комнату
-          setTimeout(() => {
-            sendSignal({ type: 'JOIN', role: myRole, code: cleanCode });
-          }, 300);
-        };
+          addLog("Сеть подключена! Входим в канал...");
 
-        ws.onmessage = (event) => {
+          const topic = `word-duel-game-v1/${cleanCode}`;
+          client.subscribe(topic, (err) => {
+            if (!err) {
+              addLog(`Канал ${cleanCode} активен`);
+              setTimeout(() => {
+                sendSignal({ type: 'JOIN', role: myRole });
+              }, 300);
+            }
+          });
+        });
+
+        client.on('message', (topic, message) => {
           try {
-            const data = JSON.parse(event.data);
-            if (data.room !== cleanCode) return; // Сообщения только нашей комнаты
+            const data = JSON.parse(message.toString());
+            // Игнорируем свои же собственные сообщения
+            if (data.senderId === myIdRef.current) return;
 
             handleIncomingSignal(data, myRole);
-          } catch(e) { console.error(e); }
-        };
+          } catch (e) {
+            console.error(e);
+          }
+        });
 
-        ws.onerror = (err) => {
-          addLog("Ошибка WebSocket сети");
-        };
+        client.on('error', (err) => {
+          addLog("Ошибка сокета HiveMQ");
+        });
 
-        ws.onclose = () => {
+        client.on('close', () => {
           setConnected(false);
           addLog("Соединение закрыто");
-        };
+        });
       };
 
-      // Проверка Hash в URL при старте
       useEffect(() => {
         const hash = window.location.hash.replace('#', '').trim().toUpperCase();
         if (hash) {
@@ -129,24 +143,22 @@
         }
       }, []);
 
-      // Обработка входящих сигналов
       const handleIncomingSignal = (data, myRole) => {
         switch (data.type) {
           case 'JOIN':
-            addLog(`Игрок (${data.role}) вошел в комнату`);
-            // Если мы уже готовы, отправляем свой статус новому игроку
+            addLog(`Второй игрок вошел!`);
             if (myRole === 'host' && hostReady) sendSignal({ type: 'READY_STATE', role: 'host', ready: true });
             if (myRole === 'guest' && guestReady) sendSignal({ type: 'READY_STATE', role: 'guest', ready: true });
             break;
 
           case 'READY_STATE':
-            addLog(`Статус готовности ${data.role}: ${data.ready ? 'ГОТОВ' : 'НЕ ГОТОВ'}`);
+            addLog(`Готовность ${data.role}: ${data.ready ? 'ГОТОВ' : 'НЕ ГОТОВ'}`);
             if (data.role === 'host') setHostReady(data.ready);
             if (data.role === 'guest') setGuestReady(data.ready);
             break;
 
           case 'START_WORD':
-            addLog(`Загадано слово длиной ${data.length} букв`);
+            addLog(`Получено слово (${data.length} букв)`);
             setSecretWord(data.word || '');
             setWordLength(data.length);
             setInputLetters(Array(data.length).fill(''));
@@ -163,13 +175,13 @@
 
           case 'GAME_OVER':
             if (myRole === 'host') {
-              setStatus(data.result); // 'won' или 'lost'
+              setStatus(data.result);
               setAttempts(data.attempts);
             }
             break;
 
           case 'RESET':
-            addLog("Игра сброшена Ведущим");
+            addLog("Игра сброшена");
             setHostReady(false);
             setGuestReady(false);
             setSecretWord('');
@@ -186,7 +198,6 @@
         }
       };
 
-      // Кнопка переключения "Я ГОТОВ"
       const toggleReady = () => {
         if (role === 'host') {
           const nextState = !hostReady;
@@ -199,7 +210,6 @@
         }
       };
 
-      // Когда оба готовы -> Переход к вводу слова
       useEffect(() => {
         if (hostReady && guestReady && status === 'lobby') {
           addLog("Оба игрока готовы!");
@@ -209,13 +219,11 @@
         }
       }, [hostReady, guestReady, status, role]);
 
-      // Создание комнаты
       const handleCreateRoom = () => {
         const newCode = Math.random().toString(36).substring(2, 7).toUpperCase();
         connectToRoom(newCode, 'host');
       };
 
-      // Вход по коду
       const handleJoinByCode = (e) => {
         e.preventDefault();
         if (inputRoomCode.trim()) {
@@ -223,7 +231,6 @@
         }
       };
 
-      // Подтверждение загаданного слова (Игрок 1)
       const handleSetSecretWord = (e) => {
         e.preventDefault();
         const clean = secretInput.trim().toUpperCase();
@@ -248,7 +255,6 @@
         });
       };
 
-      // Нажатие букв (Игрок 2)
       const handleKeyPress = (letter) => {
         if (status !== 'playing' || role !== 'guest') return;
 
@@ -272,7 +278,6 @@
         });
       };
 
-      // Стирание буквы
       const handleDelete = () => {
         if (status !== 'playing' || role !== 'guest') return;
 
@@ -298,7 +303,6 @@
         });
       };
 
-      // Проверка слова (Wordle алгоритм)
       const handleCheckWord = () => {
         if (status !== 'playing' || role !== 'guest') return;
 
@@ -358,7 +362,6 @@
         }
       };
 
-      // Сброс игры
       const handleResetGame = () => {
         sendSignal({ type: 'RESET' });
         setHostReady(false);
@@ -379,242 +382,172 @@
         setTimeout(() => setCopied(false), 2000);
       };
 
-      return (
-        <div className="min-h-screen flex flex-col justify-between p-3 sm:p-6 max-w-xl mx-auto">
-          {/* Шапка */}
-          <header className="flex flex-col sm:flex-row items-center justify-between gap-3 pb-4 border-b border-slate-800">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 bg-gradient-to-tr from-cyan-500 to-blue-600 rounded-xl flex items-center justify-center font-black text-lg">
-                W
-              </div>
-              <h1 className="text-xl font-black tracking-wider bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
-                WORD DUEL
-              </h1>
-            </div>
+      return React.createElement('div', { className: 'min-h-screen flex flex-col justify-between p-3 sm:p-6 max-w-xl mx-auto' },
+        
+        // Header
+        React.createElement('header', { className: 'flex flex-col sm:flex-row items-center justify-between gap-3 pb-4 border-b border-slate-800' },
+          React.createElement('div', { className: 'flex items-center gap-2' },
+            React.createElement('div', { className: 'w-8 h-8 bg-gradient-to-tr from-cyan-500 to-blue-600 rounded-xl flex items-center justify-center font-black text-lg' }, 'W'),
+            React.createElement('h1', { className: 'text-xl font-black tracking-wider bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent' }, 'WORD DUEL')
+          ),
+          roomId && React.createElement('div', { className: 'flex items-center gap-2 bg-slate-900 border border-slate-800 p-1.5 rounded-xl text-xs' },
+            React.createElement('span', { className: 'text-slate-400 px-2 font-mono' }, 'Код: ', React.createElement('strong', { className: 'text-cyan-400' }, roomId)),
+            React.createElement('button', { onClick: copyLink, className: 'px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded-lg transition active:scale-95' }, copied ? 'Скопировано!' : 'Ссылка'),
+            role === 'host' && React.createElement('button', { onClick: handleResetGame, className: 'px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg', title: 'Сбросить игру' }, '↺')
+          )
+        ),
 
-            {roomId && (
-              <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 p-1.5 rounded-xl text-xs">
-                <span className="text-slate-400 px-2 font-mono">Код: <strong className="text-cyan-400">{roomId}</strong></span>
-                <button onClick={copyLink} className="px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-white font-bold rounded-lg transition active:scale-95">
-                  {copied ? 'Скопировано!' : 'Ссылка'}
-                </button>
-                {role === 'host' && (
-                  <button onClick={handleResetGame} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg" title="Сбросить игру">
-                    ↺
-                  </button>
-                )}
-              </div>
-            )}
-          </header>
+        // Error message
+        errorMessage && React.createElement('div', { className: 'my-2 p-3 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-xl text-xs text-center font-semibold' }, `⚠️ ${errorMessage}`),
 
-          {/* Ошибки */}
-          {errorMessage && (
-            <div className="my-2 p-3 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-xl text-xs text-center font-semibold">
-              ⚠️ {errorMessage}
-            </div>
-          )}
+        // Main
+        React.createElement('main', { className: 'my-auto py-4' },
+          
+          // MENU
+          status === 'menu' && React.createElement('div', { className: 'bg-slate-900/80 border border-slate-800 p-6 rounded-3xl shadow-2xl flex flex-col gap-6 text-center' },
+            React.createElement('div', null,
+              React.createElement('h2', { className: 'text-2xl font-black' }, 'Онлайн Дуэль'),
+              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Играйте с другом 1 на 1 по сети')
+            ),
+            React.createElement('div', { className: 'flex flex-col gap-3' },
+              React.createElement('button', { onClick: handleCreateRoom, className: 'w-full py-4 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 font-bold rounded-2xl shadow-lg shadow-cyan-500/20 active:scale-95 transition' }, '➕ Создать новую комнату'),
+              React.createElement('div', { className: 'relative my-2' },
+                React.createElement('div', { className: 'absolute inset-0 flex items-center' }, React.createElement('div', { className: 'w-full border-t border-slate-800' })),
+                React.createElement('div', { className: 'relative text-[10px] uppercase tracking-widest text-slate-500 bg-slate-900 px-2 w-max mx-auto' }, 'Или войдите по коду')
+              ),
+              React.createElement('form', { onSubmit: handleJoinByCode, className: 'flex gap-2' },
+                React.createElement('input', {
+                  type: 'text',
+                  placeholder: 'КОД КОМНАТЫ',
+                  value: inputRoomCode,
+                  onChange: (e) => setInputRoomCode(e.target.value.toUpperCase()),
+                  className: 'flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 text-center font-mono font-bold uppercase outline-none focus:border-cyan-500'
+                }),
+                React.createElement('button', { type: 'submit', className: 'px-5 py-3 bg-slate-800 hover:bg-slate-700 font-bold rounded-xl active:scale-95 transition' }, 'Войти')
+              )
+            )
+          ),
 
-          {/* Контент */}
-          <main className="my-auto py-4">
-            
-            {/* ГЛАВНОЕ МЕНЮ (Выбор роли) */}
-            {status === 'menu' && (
-              <div className="bg-slate-900/80 border border-slate-800 p-6 rounded-3xl shadow-2xl flex flex-col gap-6 text-center">
-                <div>
-                  <h2 className="text-2xl font-black">Онлайн Дуэль</h2>
-                  <p className="text-xs text-slate-400 mt-1">Играйте с другом 1 на 1 по сети</p>
-                </div>
+          // LOBBY
+          status === 'lobby' && React.createElement('div', { className: 'bg-slate-900/80 border border-slate-800 p-6 rounded-3xl text-center flex flex-col gap-5' },
+            React.createElement('div', null,
+              React.createElement('h2', { className: 'text-xl font-bold' }, 'Лобби комнаты: ', React.createElement('span', { className: 'font-mono text-cyan-400' }, roomId)),
+              React.createElement('p', { className: 'text-xs text-slate-400 mt-1' }, 'Оба игрока должны подтвердить готовность')
+            ),
+            React.createElement('div', { className: 'grid grid-cols-2 gap-3 my-2' },
+              React.createElement('div', { className: `p-4 rounded-2xl border ${hostReady ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}` },
+                React.createElement('div', { className: 'text-xs font-semibold' }, 'Игрок 1 (Ведущий)'),
+                React.createElement('div', { className: 'text-sm font-black mt-1' }, hostReady ? 'ГОТОВ ✓' : 'Ожидание...')
+              ),
+              React.createElement('div', { className: `p-4 rounded-2xl border ${guestReady ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}` },
+                React.createElement('div', { className: 'text-xs font-semibold' }, 'Игрок 2 (Угадывает)'),
+                React.createElement('div', { className: 'text-sm font-black mt-1' }, guestReady ? 'ГОТОВ ✓' : 'Ожидание...')
+              )
+            ),
+            React.createElement('button', {
+              onClick: toggleReady,
+              className: `w-full py-4 font-black rounded-2xl transition active:scale-95 shadow-lg ${(role === 'host' ? hostReady : guestReady) ? 'bg-slate-800 hover:bg-slate-700 text-slate-300' : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/25'}`
+            }, (role === 'host' ? hostReady : guestReady) ? 'Отменить готовность' : 'Я ГОТОВ К ИГРЕ!'),
+            React.createElement('p', { className: 'text-[11px] text-slate-500' }, 'Передайте код ', React.createElement('strong', { className: 'text-slate-300 font-mono' }, roomId), ' другу для входа.')
+          ),
 
-                <div className="flex flex-col gap-3">
-                  <button 
-                    onClick={handleCreateRoom}
-                    className="w-full py-4 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 font-bold rounded-2xl shadow-lg shadow-cyan-500/20 active:scale-95 transition"
-                  >
-                    ➕ Создать новую комнату
-                  </button>
+          // SETUP (HOST)
+          status === 'setup' && role === 'host' && React.createElement('div', { className: 'bg-slate-900/80 border border-slate-800 p-6 rounded-3xl text-center flex flex-col gap-4' },
+            React.createElement('h2', { className: 'text-xl font-bold' }, 'Загадайте тайное слово'),
+            React.createElement('form', { onSubmit: handleSetSecretWord, className: 'flex flex-col gap-3' },
+              React.createElement('input', {
+                type: 'text',
+                value: secretInput,
+                onChange: (e) => setSecretInput(e.target.value.toUpperCase()),
+                placeholder: 'СЛОВО (3-10 БУКВ)',
+                maxLength: 10,
+                className: 'w-full bg-slate-950 border-2 border-slate-700 focus:border-cyan-500 rounded-2xl p-4 text-center text-2xl font-black tracking-widest uppercase outline-none',
+                autoFocus: true
+              }),
+              React.createElement('button', { type: 'submit', className: 'w-full py-4 bg-cyan-600 hover:bg-cyan-500 font-bold rounded-2xl shadow-lg shadow-cyan-600/20 active:scale-95' }, 'Начать дуэль!')
+            )
+          ),
 
-                  <div className="relative my-2">
-                    <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-800"></div></div>
-                    <div className="relative text-[10px] uppercase tracking-widest text-slate-500 bg-slate-900 px-2 w-max mx-auto">Или войдите по коду</div>
-                  </div>
+          // PLAYING / WON / LOST
+          (status === 'playing' || status === 'won' || status === 'lost') && React.createElement('div', { className: 'flex flex-col items-center gap-5' },
+            React.createElement('div', { className: 'w-full flex justify-between items-center text-xs text-slate-400 px-2' },
+              React.createElement('span', null, 'Попытки: ', React.createElement('strong', { className: 'text-cyan-400 font-bold text-sm' }, `${attempts} / 6`)),
+              role === 'host' && React.createElement('span', null, 'Загадано: ', React.createElement('strong', { className: 'text-emerald-400 font-mono' }, secretWord))
+            ),
 
-                  <form onSubmit={handleJoinByCode} className="flex gap-2">
-                    <input 
-                      type="text" 
-                      placeholder="КОД КОМНАТЫ"
-                      value={inputRoomCode}
-                      onChange={(e) => setInputRoomCode(e.target.value.toUpperCase())}
-                      className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 text-center font-mono font-bold uppercase outline-none focus:border-cyan-500"
-                    />
-                    <button type="submit" className="px-5 py-3 bg-slate-800 hover:bg-slate-700 font-bold rounded-xl active:scale-95 transition">
-                      Войти
-                    </button>
-                  </form>
-                </div>
-              </div>
-            )}
+            // Letter Grid
+            React.createElement('div', { className: 'flex justify-center gap-1.5 sm:gap-2 w-full py-2' },
+              Array.from({ length: wordLength }).map((_, idx) => {
+                let letter = '';
+                let st = 'none';
 
-            {/* ЛОББИ ГОТОВНОСТИ */}
-            {status === 'lobby' && (
-              <div className="bg-slate-900/80 border border-slate-800 p-6 rounded-3xl text-center flex flex-col gap-5">
-                <div>
-                  <h2 className="text-xl font-bold">Лобби комнаты: <span className="font-mono text-cyan-400">{roomId}</span></h2>
-                  <p className="text-xs text-slate-400 mt-1">Оба игрока должны подтвердить готовность</p>
-                </div>
+                if (role === 'guest') {
+                  letter = inputLetters[idx] || '';
+                  st = letterStatuses[idx] || 'none';
+                } else {
+                  letter = (remoteGuestInput || '')[idx] || '';
+                  st = (remoteGuestStatuses || [])[idx] || 'none';
+                }
 
-                {/* Статусы игроков */}
-                <div className="grid grid-cols-2 gap-3 my-2">
-                  <div className={`p-4 rounded-2xl border ${hostReady ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}`}>
-                    <div className="text-xs font-semibold">Игрок 1 (Ведущий)</div>
-                    <div className="text-sm font-black mt-1">{hostReady ? 'ГОТОВ ✓' : 'Ожидание...'}</div>
-                  </div>
+                const isActive = role === 'guest' && idx === activeCellIndex && status === 'playing';
 
-                  <div className={`p-4 rounded-2xl border ${guestReady ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300' : 'bg-slate-950 border-slate-800 text-slate-500'}`}>
-                    <div className="text-xs font-semibold">Игрок 2 (Угадывает)</div>
-                    <div className="text-sm font-black mt-1">{guestReady ? 'ГОТОВ ✓' : 'Ожидание...'}</div>
-                  </div>
-                </div>
+                let colorClass = "bg-slate-900 border-slate-800 text-white";
+                if (st === 'correct') colorClass = "bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-900/30";
+                if (st === 'present') colorClass = "bg-amber-500 border-amber-400 text-white shadow-lg shadow-amber-900/30";
+                if (st === 'absent') colorClass = "bg-slate-800 border-slate-700 text-slate-400";
 
-                <button 
-                  onClick={toggleReady}
-                  className={`w-full py-4 font-black rounded-2xl transition active:scale-95 shadow-lg ${
-                    (role === 'host' ? hostReady : guestReady) 
-                      ? 'bg-slate-800 hover:bg-slate-700 text-slate-300' 
-                      : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/25'
-                  }`}
-                >
-                  {(role === 'host' ? hostReady : guestReady) ? 'Отменить готовность' : 'Я ГОТОВ К ИГРЕ!'}
-                </button>
+                return React.createElement('button', {
+                  key: idx,
+                  onClick: () => role === 'guest' && status === 'playing' && setActiveCellIndex(idx),
+                  className: `w-11 h-14 sm:w-14 sm:h-16 rounded-xl border-2 font-black text-2xl flex items-center justify-center uppercase transition-all ${colorClass} ${isActive ? 'ring-4 ring-cyan-500/30 border-cyan-400 scale-105' : ''}`
+                }, letter);
+              })
+            ),
 
-                <p className="text-[11px] text-slate-500">
-                  Передайте код <strong className="text-slate-300 font-mono">{roomId}</strong> другу для входа.
-                </p>
-              </div>
-            )}
+            // Victory / Defeat modals
+            status === 'won' && React.createElement('div', { className: 'p-4 bg-emerald-950/60 border border-emerald-500/40 rounded-2xl text-center w-full' },
+              React.createElement('h3', { className: 'text-lg font-black text-emerald-300' }, 'СЛОВО УГАДАНО! 🎉'),
+              React.createElement('p', { className: 'text-xs text-slate-300 mt-1' }, 'Правильное слово: ', React.createElement('strong', null, secretWord))
+            ),
 
-            {/* ВЕДУЩИЙ ЗАГАДЫВАЕТ СЛОВО */}
-            {status === 'setup' && role === 'host' && (
-              <div className="bg-slate-900/80 border border-slate-800 p-6 rounded-3xl text-center flex flex-col gap-4">
-                <h2 className="text-xl font-bold">Загадайте тайное слово</h2>
-                <form onSubmit={handleSetSecretWord} className="flex flex-col gap-3">
-                  <input 
-                    type="text" 
-                    value={secretInput}
-                    onChange={(e) => setSecretInput(e.target.value.toUpperCase())}
-                    placeholder="СЛОВО (3-10 БУКВ)"
-                    maxLength={10}
-                    className="w-full bg-slate-950 border-2 border-slate-700 focus:border-cyan-500 rounded-2xl p-4 text-center text-2xl font-black tracking-widest uppercase outline-none"
-                    autoFocus
-                  />
-                  <button type="submit" className="w-full py-4 bg-cyan-600 hover:bg-cyan-500 font-bold rounded-2xl shadow-lg shadow-cyan-600/20 active:scale-95">
-                    Начать дуэль!
-                  </button>
-                </form>
-              </div>
-            )}
+            status === 'lost' && React.createElement('div', { className: 'p-4 bg-rose-950/60 border border-rose-500/40 rounded-2xl text-center w-full' },
+              React.createElement('h3', { className: 'text-lg font-black text-rose-400' }, 'ПОПЫТКИ ЗАКАНЧАЛИСЬ! 😞'),
+              React.createElement('p', { className: 'text-xs text-slate-300 mt-1' }, 'Правильное слово: ', React.createElement('strong', null, secretWord))
+            ),
 
-            {/* ИГРОВОЕ ПОЛЕ */}
-            {(status === 'playing' || status === 'won' || status === 'lost') && (
-              <div className="flex flex-col items-center gap-5">
-                <div className="w-full flex justify-between items-center text-xs text-slate-400 px-2">
-                  <span>Попытки: <strong className="text-cyan-400 font-bold text-sm">{attempts} / 6</strong></span>
-                  {role === 'host' && <span>Загадано: <strong className="text-emerald-400 font-mono">{secretWord}</strong></span>}
-                </div>
+            // Keyboard for guest
+            role === 'guest' && status === 'playing' && React.createElement('div', { className: 'w-full flex flex-col gap-1.5 select-none mt-2' },
+              KEYBOARD_ROWS.map((row, rIdx) => 
+                React.createElement('div', { key: rIdx, className: 'flex justify-center gap-1' },
+                  row.map(char => React.createElement('button', {
+                    key: char,
+                    onClick: () => handleKeyPress(char),
+                    className: 'flex-1 max-w-[38px] h-11 bg-slate-800 hover:bg-slate-700 rounded-lg font-bold text-sm text-slate-200 active:bg-cyan-600 transition'
+                  }, char))
+                )
+              ),
+              React.createElement('div', { className: 'flex gap-2 mt-1' },
+                React.createElement('button', { onClick: handleDelete, className: 'flex-1 py-3 bg-slate-800 hover:bg-slate-700 font-bold rounded-xl text-xs active:bg-rose-600 transition' }, '✕ СТЕРЕТЬ'),
+                React.createElement('button', { onClick: handleCheckWord, className: 'flex-2 py-3 bg-emerald-600 hover:bg-emerald-500 font-bold rounded-xl text-xs active:scale-95 transition shadow-lg shadow-emerald-600/20' }, '✓ ПРОВЕРИТЬ')
+              )
+            )
+          )
+        ),
 
-                {/* Единая интерактивная строка ячеек */}
-                <div className="flex justify-center gap-1.5 sm:gap-2 w-full py-2">
-                  {Array.from({ length: wordLength }).map((_, idx) => {
-                    let letter = '';
-                    let st = 'none';
-
-                    if (role === 'guest') {
-                      letter = inputLetters[idx] || '';
-                      st = letterStatuses[idx] || 'none';
-                    } else {
-                      letter = (remoteGuestInput || '')[idx] || '';
-                      st = (remoteGuestStatuses || [])[idx] || 'none';
-                    }
-
-                    const isActive = role === 'guest' && idx === activeCellIndex && status === 'playing';
-
-                    let colorClass = "bg-slate-900 border-slate-800 text-white";
-                    if (st === 'correct') colorClass = "bg-emerald-600 border-emerald-500 text-white shadow-lg shadow-emerald-900/30";
-                    if (st === 'present') colorClass = "bg-amber-500 border-amber-400 text-white shadow-lg shadow-amber-900/30";
-                    if (st === 'absent') colorClass = "bg-slate-800 border-slate-700 text-slate-400";
-
-                    return (
-                      <button
-                        key={idx}
-                        onClick={() => role === 'guest' && status === 'playing' && setActiveCellIndex(idx)}
-                        className={`w-11 h-14 sm:w-14 sm:h-16 rounded-xl border-2 font-black text-2xl flex items-center justify-center uppercase transition-all ${colorClass} ${isActive ? 'ring-4 ring-cyan-500/30 border-cyan-400 scale-105' : ''}`}
-                      >
-                        {letter}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* Окна Финала */}
-                {status === 'won' && (
-                  <div className="p-4 bg-emerald-950/60 border border-emerald-500/40 rounded-2xl text-center w-full">
-                    <h3 className="text-lg font-black text-emerald-300">СЛОВО УГАДАНО! 🎉</h3>
-                    <p className="text-xs text-slate-300 mt-1">Правильное слово: <strong>{secretWord}</strong></p>
-                  </div>
-                )}
-
-                {status === 'lost' && (
-                  <div className="p-4 bg-rose-950/60 border border-rose-500/40 rounded-2xl text-center w-full">
-                    <h3 className="text-lg font-black text-rose-400">ПОПЫТКИ ЗАКАНЧАЛИСЬ! 😞</h3>
-                    <p className="text-xs text-slate-300 mt-1">Правильное слово: <strong>{secretWord}</strong></p>
-                  </div>
-                )}
-
-                {/* Виртуальная клавиатура для Отгадывающего */}
-                {role === 'guest' && status === 'playing' && (
-                  <div className="w-full flex flex-col gap-1.5 select-none mt-2">
-                    {KEYBOARD_ROWS.map((row, rIdx) => (
-                      <div key={rIdx} className="flex justify-center gap-1">
-                        {row.map(char => (
-                          <button
-                            key={char}
-                            onClick={() => handleKeyPress(char)}
-                            className="flex-1 max-w-[38px] h-11 bg-slate-800 hover:bg-slate-700 rounded-lg font-bold text-sm text-slate-200 active:bg-cyan-600 transition"
-                          >
-                            {char}
-                          </button>
-                        ))}
-                      </div>
-                    ))}
-                    <div className="flex gap-2 mt-1">
-                      <button onClick={handleDelete} className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 font-bold rounded-xl text-xs active:bg-rose-600 transition">
-                        ✕ СТЕРЕТЬ
-                      </button>
-                      <button onClick={handleCheckWord} className="flex-2 py-3 bg-emerald-600 hover:bg-emerald-500 font-bold rounded-xl text-xs active:scale-95 transition shadow-lg shadow-emerald-600/20">
-                        ✓ ПРОВЕРИТЬ
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-          </main>
-
-          {/* Встроенное окно сетевых логов прямо на экране */}
-          <footer className="mt-4 pt-3 border-t border-slate-800/60 text-[10px] text-slate-500 font-mono">
-            <div className="flex justify-between items-center mb-1">
-              <span>Статус сети: <strong className={connected ? "text-emerald-400" : "text-amber-400"}>{connected ? "Подключено" : "Отключено"}</strong></span>
-              <span>Роль: {role || 'Не выбрана'}</span>
-            </div>
-            <div className="bg-slate-900/90 border border-slate-800 p-2 rounded-lg max-h-20 overflow-y-auto space-y-0.5">
-              {logs.map((log, i) => <div key={i}>&gt; {log}</div>)}
-            </div>
-          </footer>
-        </div>
+        // Footer
+        React.createElement('footer', { className: 'mt-4 pt-3 border-t border-slate-800/60 text-[10px] text-slate-500 font-mono' },
+          React.createElement('div', { className: 'flex justify-between items-center mb-1' },
+            React.createElement('span', null, 'Сеть HiveMQ: ', React.createElement('strong', { className: connected ? "text-emerald-400" : "text-amber-400" }, connected ? "Подключено" : "Отключено")),
+            React.createElement('span', null, 'Роль: ', role || 'Не выбрана')
+          ),
+          React.createElement('div', { className: 'bg-slate-900/90 border border-slate-800 p-2 rounded-lg max-h-20 overflow-y-auto space-y-0.5' },
+            logs.map((log, i) => React.createElement('div', { key: i }, `> ${log}`))
+          )
+        )
       );
     }
 
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
   </script>
 </body>
 </html>
