@@ -321,7 +321,7 @@ function render() {
   h += `<footer class="pt-3 border-t border-slate-800 text-[10px] text-slate-500 font-mono">
     <div class="flex justify-between mb-1">
       <span>Связь: <b class="${S.connected ? 'text-emerald-400' : 'text-amber-400'}">${S.connected ? 'есть' : 'нет'}</b></span>
-      <span>Роль: ${S.role || '—'}</span>
+      <span>Роль: ${S.role || '—'} · версия 3</span>
     </div>
     <div class="bg-slate-900 border border-slate-800 p-2 rounded-lg max-h-24 overflow-y-auto">${S.logs.map(l => '> ' + esc(l)).join('<br>')}</div>
   </footer>`;
